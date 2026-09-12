@@ -1,0 +1,10 @@
+PVE VM Provisioner for ColdFront
+Copyright 2026 Robert Romero
+
+Maintained by Sqoia Labs and distributed under the GNU Affero General Public
+License, version 3 or later. Sqoia Labs is an operating name; this notice does
+not assert a separately formed legal entity.
+
+The project began as a private, site-specific UC Merced implementation. This
+public repository begins with the generalized source so private institutional
+configuration is not exposed through reachable Git history.

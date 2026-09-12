@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coldfront-pve-provisioner"
+version = "0.1.0"
+description = "Guarded Proxmox VE virtual-machine provisioning for ColdFront"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+authors = [
+  { name = "Robert Romero", email = "1013414+NessieCanCode@users.noreply.github.com" },
+]
+dependencies = [
+  "bibtexparser<2",
+  "coldfront>=1.1,<1.2",
+  "python-dateutil>=2.8,<3",
+  "requests>=2.31,<3",
+]
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Framework :: Django",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: System :: Systems Administration",
+]
+
+[project.urls]
+Documentation = "https://github.com/sqoia-dev/coldfront-pve-provisioner#readme"
+Issues = "https://github.com/sqoia-dev/coldfront-pve-provisioner/issues"
+Repository = "https://github.com/sqoia-dev/coldfront-pve-provisioner"
+
+[tool.setuptools.packages.find]
+include = ["coldfront_pve_provisioner*"]
