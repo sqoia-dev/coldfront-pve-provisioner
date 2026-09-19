@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from datetime import timezone as datetime_timezone
+from functools import partial
 
 from django.conf import settings
 from django.db import transaction
@@ -7,6 +8,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from .guest_access import render_access_reconcile_payload
+from .guest_policy import render_guest_policy
 from .models import (
     ProvisioningEvent,
     ProvisioningJob,
@@ -17,10 +19,12 @@ from .models import (
 from .netbox import NetBoxClient
 from .proxmox import ProxmoxClient
 from .services import (
+    create_guest_patch_job,
     desired_access_usernames,
     dispatch_job,
     request_ssh_public_key,
     safe_queue_access_reconciliation,
+    safe_queue_retirement,
     sync_projections,
 )
 
@@ -47,8 +51,11 @@ def _claim_job(job_id):
     job.save(update_fields=["status", "attempts", "started_at", "error", "updated_at"])
     vm = job.virtual_machine
     retiring = job.action == ProvisioningJob.Action.RETIRE
-    reconciling = job.action == ProvisioningJob.Action.RECONCILE
-    if not reconciling:
+    guest_maintenance = job.action in (
+        ProvisioningJob.Action.RECONCILE,
+        ProvisioningJob.Action.PATCH,
+    )
+    if not guest_maintenance:
         vm.state = (
             VirtualMachine.State.RETIRING
             if retiring
@@ -63,8 +70,10 @@ def _claim_job(job_id):
         event_type=(
             "Retirement Worker Started"
             if retiring
-            else "Directory Access Worker Started"
-            if reconciling
+            else "Guest Patch Worker Started"
+            if job.action == ProvisioningJob.Action.PATCH
+            else "Guest Reconciliation Worker Started"
+            if guest_maintenance
             else "Worker Started"
         ),
     )
@@ -83,6 +92,8 @@ def run_job(job_id):
         return _run_retirement_job(job, vm)
     if job.action == ProvisioningJob.Action.RECONCILE:
         return _run_access_reconciliation_job(job, vm)
+    if job.action == ProvisioningJob.Action.PATCH:
+        return _run_guest_patch_job(job, vm)
     if not getattr(settings, "PVE_PROVISIONER_EXECUTE", False):
         error = "External provisioning gate PVE_PROVISIONER_EXECUTE is disabled."
         _finish(
@@ -114,8 +125,17 @@ def run_job(job_id):
                 vm.pk, job.pk, event_type, metadata or {}
             ),
         )
+        desired = desired_access_usernames(vm.allocation)
+        if configuration.guest_policy_enabled:
+            _apply_guest_policy(
+                pve,
+                target_node,
+                vm,
+                job,
+                desired,
+                apply_updates=False,
+            )
         if configuration.guest_access_enabled:
-            desired = desired_access_usernames(vm.allocation)
             pve.guest_exec(
                 target_node,
                 vm.vmid,
@@ -148,32 +168,86 @@ def run_job(job_id):
 
 def _run_access_reconciliation_job(job, vm):
     configuration = get_configuration()
-    if not configuration.guest_access_enabled:
-        _finish_access(
-            job.pk, ProvisioningJob.Status.BLOCKED, "Guest access sync is disabled."
+    policy_requested = bool(
+        job.metadata.get("guest_policy", configuration.guest_policy_enabled)
+    )
+    access_requested = bool(
+        job.metadata.get("directory_access", configuration.guest_access_enabled)
+    )
+    if vm.allocation.status.name != "Active" or vm.state != VirtualMachine.State.ACTIVE:
+        error = (
+            "The allocation or VM is no longer active; refusing guest reconciliation."
+        )
+        _finish_guest_job(
+            job.pk,
+            ProvisioningJob.Status.BLOCKED,
+            error,
+            policy_requested=policy_requested,
+            access_requested=access_requested,
+        )
+        return {"status": "blocked", "job_id": str(job.pk)}
+    if not policy_requested and not access_requested:
+        _finish_guest_job(
+            job.pk,
+            ProvisioningJob.Status.BLOCKED,
+            "No guest reconciliation component is enabled.",
+            policy_requested=False,
+            access_requested=False,
         )
         return {"status": "blocked", "job_id": str(job.pk)}
     if not getattr(settings, "PVE_PROVISIONER_EXECUTE", False):
         error = "External provisioning gate PVE_PROVISIONER_EXECUTE is disabled."
-        _finish_access(job.pk, ProvisioningJob.Status.BLOCKED, error)
+        _finish_guest_job(
+            job.pk,
+            ProvisioningJob.Status.BLOCKED,
+            error,
+            policy_requested=policy_requested,
+            access_requested=access_requested,
+        )
         return {"status": "blocked", "job_id": str(job.pk)}
     desired = desired_access_usernames(vm.allocation)
+    policy_completed = False
+    access_completed = False
     try:
         pve = ProxmoxClient()
         target = pve.require_exact_vm(vm)
-        pve.guest_exec(
-            target,
-            vm.vmid,
-            [configuration.guest_access_helper],
-            input_data=render_access_reconcile_payload(desired),
-            timeout=600,
-        )
+        if policy_requested:
+            _apply_guest_policy(
+                pve,
+                target,
+                vm,
+                job,
+                desired,
+                apply_updates=False,
+            )
+            policy_completed = True
+        if access_requested:
+            pve.guest_exec(
+                target,
+                vm.vmid,
+                [configuration.guest_access_helper],
+                input_data=render_access_reconcile_payload(desired),
+                timeout=600,
+            )
+            _record_access_sync(vm.pk, job.pk, desired)
+            access_completed = True
     except Exception as exc:
         error = str(exc)[:4000]
-        _finish_access(job.pk, ProvisioningJob.Status.FAILED, error)
+        _finish_guest_job(
+            job.pk,
+            ProvisioningJob.Status.FAILED,
+            error,
+            policy_requested=policy_requested and not policy_completed,
+            access_requested=access_requested and not access_completed,
+        )
         raise
-    _record_access_sync(vm.pk, job.pk, desired)
-    _finish_access(job.pk, ProvisioningJob.Status.SUCCEEDED, "")
+    _finish_guest_job(
+        job.pk,
+        ProvisioningJob.Status.SUCCEEDED,
+        "",
+        policy_requested=policy_requested,
+        access_requested=access_requested,
+    )
     safe_queue_access_reconciliation(vm.allocation_id)
     return {
         "status": "succeeded",
@@ -181,6 +255,72 @@ def _run_access_reconciliation_job(job, vm):
         "vmid": vm.vmid,
         "usernames": desired,
     }
+
+
+def _run_guest_patch_job(job, vm):
+    configuration = get_configuration()
+    if vm.allocation.status.name != "Active" or vm.state != VirtualMachine.State.ACTIVE:
+        error = "The allocation or VM is no longer active; refusing guest patching."
+        _finish_guest_job(
+            job.pk,
+            ProvisioningJob.Status.BLOCKED,
+            error,
+            policy_requested=True,
+            access_requested=False,
+        )
+        return {"status": "blocked", "job_id": str(job.pk)}
+    if (
+        not configuration.guest_policy_enabled
+        or configuration.guest_patch_mode == configuration.GuestPatchMode.NONE
+    ):
+        _finish_guest_job(
+            job.pk,
+            ProvisioningJob.Status.BLOCKED,
+            "Guest patching is disabled in Django admin.",
+            policy_requested=True,
+            access_requested=False,
+        )
+        return {"status": "blocked", "job_id": str(job.pk)}
+    if not getattr(settings, "PVE_PROVISIONER_EXECUTE", False):
+        error = "External provisioning gate PVE_PROVISIONER_EXECUTE is disabled."
+        _finish_guest_job(
+            job.pk,
+            ProvisioningJob.Status.BLOCKED,
+            error,
+            policy_requested=True,
+            access_requested=False,
+        )
+        return {"status": "blocked", "job_id": str(job.pk)}
+    desired = desired_access_usernames(vm.allocation)
+    try:
+        pve = ProxmoxClient()
+        target = pve.require_exact_vm(vm)
+        _apply_guest_policy(
+            pve,
+            target,
+            vm,
+            job,
+            desired,
+            apply_updates=True,
+        )
+    except Exception as exc:
+        error = str(exc)[:4000]
+        _finish_guest_job(
+            job.pk,
+            ProvisioningJob.Status.FAILED,
+            error,
+            policy_requested=True,
+            access_requested=False,
+        )
+        raise
+    _finish_guest_job(
+        job.pk,
+        ProvisioningJob.Status.SUCCEEDED,
+        "",
+        policy_requested=True,
+        access_requested=False,
+    )
+    return {"status": "succeeded", "job_id": str(job.pk), "vmid": vm.vmid}
 
 
 def _run_retirement_job(job, vm):
@@ -340,6 +480,35 @@ def cleanup_expired_retirement_backups():
     return {"status": "succeeded", "deleted": deleted}
 
 
+def queue_due_guest_patch_jobs():
+    configuration = get_configuration()
+    if (
+        not configuration.guest_policy_enabled
+        or configuration.guest_patch_mode == configuration.GuestPatchMode.NONE
+        or not configuration.guest_patch_interval_days
+    ):
+        return {"status": "disabled", "queued": 0}
+    due_before = timezone.now() - timedelta(
+        days=configuration.guest_patch_interval_days
+    )
+    allocation_ids = list(
+        VirtualMachine.objects.filter(
+            allocation__status__name="Active",
+            state=VirtualMachine.State.ACTIVE,
+        )
+        .filter(Q(guest_patched_at__isnull=True) | Q(guest_patched_at__lte=due_before))
+        .order_by("vmid")
+        .values_list("allocation_id", flat=True)
+    )
+    queued = 0
+    for allocation_id in allocation_ids:
+        job = create_guest_patch_job(allocation_id)
+        if job and not job.django_q_task_id:
+            dispatch_job(job)
+            queued += 1
+    return {"status": "succeeded", "queued": queued}
+
+
 @transaction.atomic
 def _record_backup_upid(vm_id, job_id, upid):
     vm = VirtualMachine.objects.select_for_update().get(pk=vm_id)
@@ -445,6 +614,33 @@ def _record_progress(vm_id, job_id, event_type, metadata):
     )
 
 
+def _apply_guest_policy(pve, target, vm, job, usernames, *, apply_updates=False):
+    configuration = get_configuration()
+    payload, applied_digest = render_guest_policy(
+        configuration, vm, usernames, apply_updates=apply_updates
+    )
+    pve.guest_exec(
+        target,
+        vm.vmid,
+        [configuration.guest_policy_helper, "--apply-json"],
+        input_data=payload,
+        timeout=1800 if apply_updates else 900,
+    )
+    policy_digest = applied_digest
+    if apply_updates:
+        _, policy_digest = render_guest_policy(
+            configuration, vm, usernames, apply_updates=False
+        )
+    _record_guest_policy_sync(
+        vm.pk,
+        job.pk,
+        policy_digest,
+        applied_digest,
+        usernames,
+        patched=apply_updates,
+    )
+
+
 def _is_transient_provisioning_error(error):
     detail = error.lower()
     permanent = (
@@ -533,10 +729,48 @@ def _record_access_sync(vm_id, job_id, usernames):
 
 
 @transaction.atomic
-def _finish_access(job_id, job_status, error):
+def _record_guest_policy_sync(
+    vm_id, job_id, policy_digest, applied_digest, usernames, *, patched
+):
+    vm = VirtualMachine.objects.select_for_update().get(pk=vm_id)
+    now = timezone.now()
+    vm.guest_policy_hash = policy_digest
+    vm.guest_policy_last_error = ""
+    vm.guest_policy_applied_at = now
+    update_fields = [
+        "guest_policy_hash",
+        "guest_policy_last_error",
+        "guest_policy_applied_at",
+        "updated_at",
+    ]
+    if patched:
+        vm.guest_patched_at = now
+        update_fields.append("guest_patched_at")
+    vm.save(update_fields=update_fields)
+    ProvisioningEvent.objects.create(
+        virtual_machine=vm,
+        job_id=job_id,
+        event_type="Guest Patched" if patched else "Guest Policy Synchronized",
+        metadata={
+            "manifest_sha256": applied_digest,
+            "policy_sha256": policy_digest,
+            "usernames": usernames,
+        },
+    )
+
+
+@transaction.atomic
+def _finish_guest_job(
+    job_id,
+    job_status,
+    error,
+    *,
+    policy_requested,
+    access_requested,
+):
     job = (
         ProvisioningJob.objects.select_for_update()
-        .select_related("virtual_machine")
+        .select_related("virtual_machine__allocation__status")
         .get(pk=job_id)
     )
     job.status = job_status
@@ -544,21 +778,44 @@ def _finish_access(job_id, job_status, error):
     job.completed_at = timezone.now()
     job.save(update_fields=["status", "error", "completed_at", "updated_at"])
     vm = job.virtual_machine
-    vm.access_last_error = error
+    update_fields = ["last_error", "state", "updated_at"]
+    if access_requested:
+        vm.access_last_error = error
+        update_fields.append("access_last_error")
+    if policy_requested:
+        vm.guest_policy_last_error = error
+        update_fields.append("guest_policy_last_error")
     vm.last_error = error
-    vm.state = (
-        VirtualMachine.State.ACTIVE
-        if job_status == ProvisioningJob.Status.SUCCEEDED
-        else VirtualMachine.State.FAILED
-    )
-    vm.save(update_fields=["access_last_error", "last_error", "state", "updated_at"])
+    # Maintenance failures do not make an otherwise running VM disappear from
+    # inventory. If its allocation was disabled during the operation, preserve
+    # the retirement transition and arrange the guarded follow-up job.
+    allocation_active = vm.allocation.status.name == "Active"
+    if allocation_active and vm.state not in (
+        VirtualMachine.State.RETIRING,
+        VirtualMachine.State.RETIRED,
+    ):
+        vm.state = VirtualMachine.State.ACTIVE
+    elif vm.state not in (
+        VirtualMachine.State.RETIRING,
+        VirtualMachine.State.RETIRED,
+    ):
+        vm.state = VirtualMachine.State.RETIREMENT_REVIEW
+    vm.save(update_fields=update_fields)
     sync_projections(vm)
     ProvisioningEvent.objects.create(
         virtual_machine=vm,
         job=job,
-        event_type=f"Directory Access {job_status}",
-        metadata={"error": error},
+        event_type=f"Guest {job.action} {job_status}",
+        metadata={
+            "directory_access": access_requested,
+            "error": error,
+            "guest_policy": policy_requested,
+        },
     )
+    if not allocation_active:
+        transaction.on_commit(
+            partial(safe_queue_retirement, vm.allocation_id), robust=True
+        )
 
 
 @transaction.atomic

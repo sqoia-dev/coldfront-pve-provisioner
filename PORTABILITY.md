@@ -2,11 +2,12 @@
 
 ## Generalized in 0.1
 
-UC Merced network ranges, hostnames, PVE nodes/storage, template, guest username,
-service term, flavors, NetBox identity, LDAP labels, and backup retention are no
-longer compiled into the package. Site policy is typed and validated in Django
-admin. The plugin depends only on public ColdFront interfaces, not a private
-allocation UI package.
+Institutional network ranges, hostnames, PVE nodes/storage, template, guest
+username, service term, flavors, NetBox identity, LDAP policy, guest packages,
+managed files, service units, patch cadence, and backup retention are not
+compiled into the package. Site policy is typed and validated in Django admin.
+The plugin depends only on public ColdFront interfaces, not a private allocation
+UI package.
 
 ## Required assumptions
 
@@ -17,14 +18,18 @@ allocation UI package.
 - One PVE bridge and storage policy across allowed target nodes.
 - PVE firewall enabled on the inherited primary interface.
 - Static IPv4 configuration; IPv6 and DHCP are not implemented.
-- Optional user reconciliation through a site-provided QGA helper.
+- Optional declarative reconciliation through the versioned reference helper on
+  a systemd-based Linux guest using DNF or APT.
+- Optional legacy user reconciliation through a separate site-provided helper.
 - Optional retirement requires PBS storage visible through PVE.
 
 ## Not yet portable
 
 External IPAM authority, multiple pools/templates/tenants, LXC, IPv6, DHCP,
 DNS record mutation, quota/billing, HA placement constraints, online migration,
-and automated restore are outside this release.
+Windows guests, non-systemd service managers, package repository configuration,
+secret delivery, automatic reboot orchestration, distribution upgrades, and
+automated restore are outside this release.
 
 ## UC Merced migration
 

@@ -278,7 +278,10 @@ class ProxmoxClient:
         progress("Proxmox VM Running", {"target_node": target})
         self.wait_for_ssh(vm.ipv4_address)
         progress("SSH Ready", {"target_node": target})
-        if self.configuration.guest_access_enabled:
+        if (
+            self.configuration.guest_access_enabled
+            or self.configuration.guest_policy_enabled
+        ):
             self.wait_for_guest_agent_ready(target, vm.vmid)
             progress("Guest Agent Ready", {"target_node": target})
         return target

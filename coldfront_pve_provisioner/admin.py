@@ -1,6 +1,7 @@
 from django.contrib import admin
 
 from .models import (
+    GuestManagedFile,
     IPAddressReservation,
     ProvisionerConfiguration,
     ProvisionerFlavor,
@@ -10,8 +11,28 @@ from .models import (
 )
 
 
+class GuestManagedFileInline(admin.StackedInline):
+    model = GuestManagedFile
+    extra = 0
+    fieldsets = (
+        (
+            None,
+            {
+                "fields": (
+                    "enabled",
+                    "path",
+                    "content_template",
+                    ("owner", "group", "mode"),
+                    "sort_order",
+                )
+            },
+        ),
+    )
+
+
 @admin.register(ProvisionerConfiguration)
 class ProvisionerConfigurationAdmin(admin.ModelAdmin):
+    inlines = (GuestManagedFileInline,)
     fieldsets = (
         (
             "Activation and catalog",
@@ -71,7 +92,23 @@ class ProvisionerConfigurationAdmin(admin.ModelAdmin):
             },
         ),
         (
-            "Optional guest access",
+            "Declarative guest configuration",
+            {
+                "fields": (
+                    "guest_policy_enabled",
+                    "guest_policy_helper",
+                    "guest_package_manager",
+                    "guest_packages",
+                    "guest_service_units",
+                    "guest_enable_services",
+                    "guest_reconcile_on_membership_change",
+                    "guest_patch_mode",
+                    "guest_patch_interval_days",
+                )
+            },
+        ),
+        (
+            "Optional directory access",
             {
                 "fields": (
                     "guest_access_enabled",
@@ -143,6 +180,10 @@ class VirtualMachineAdmin(admin.ModelAdmin):
         "ipv4_address",
         "hostname",
         "template_vmid",
+        "guest_policy_hash",
+        "guest_policy_applied_at",
+        "guest_policy_last_error",
+        "guest_patched_at",
         "provisioned_at",
         "pve_deleted_at",
         "netbox_deleted_at",

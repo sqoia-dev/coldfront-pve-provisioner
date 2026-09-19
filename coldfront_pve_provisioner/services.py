@@ -11,6 +11,7 @@ from django.utils import timezone
 
 from .constants import hostname_for, ipv4_for_vmid
 from .guest_access import normalize_usernames
+from .guest_policy import render_guest_policy
 from .models import (
     ProvisioningEvent,
     ProvisioningJob,
@@ -212,8 +213,13 @@ def safe_queue_allocation(allocation_id):
 
 
 @transaction.atomic
-def create_access_reconciliation_job(allocation_id):
-    if not get_configuration().guest_access_enabled:
+def create_access_reconciliation_job(allocation_id, *, membership_change=False):
+    configuration = get_configuration()
+    policy_requested = configuration.guest_policy_enabled and (
+        not membership_change or configuration.guest_reconcile_on_membership_change
+    )
+    access_requested = configuration.guest_access_enabled
+    if not policy_requested and not access_requested:
         return None
     vm = (
         VirtualMachine.objects.select_for_update()
@@ -237,7 +243,18 @@ def create_access_reconciliation_job(allocation_id):
     if vm.access_desired_users != desired:
         vm.access_desired_users = desired
         vm.save(update_fields=["access_desired_users", "updated_at"])
-    if vm.access_applied_users == desired and not vm.access_last_error:
+    access_needed = access_requested and (
+        vm.access_applied_users != desired or bool(vm.access_last_error)
+    )
+    expected_policy_hash = ""
+    if policy_requested:
+        _, expected_policy_hash = render_guest_policy(
+            configuration, vm, desired, apply_updates=False
+        )
+    policy_needed = policy_requested and (
+        vm.guest_policy_hash != expected_policy_hash or bool(vm.guest_policy_last_error)
+    )
+    if not access_needed and not policy_needed:
         return None
     open_job = vm.provisioning_jobs.filter(
         action=ProvisioningJob.Action.RECONCILE,
@@ -248,26 +265,82 @@ def create_access_reconciliation_job(allocation_id):
     job = ProvisioningJob.objects.create(
         virtual_machine=vm,
         action=ProvisioningJob.Action.RECONCILE,
+        metadata={
+            "directory_access": access_needed,
+            "guest_policy": policy_needed,
+        },
     )
     ProvisioningEvent.objects.create(
         virtual_machine=vm,
         job=job,
-        event_type="Directory Access Queued",
-        metadata={"usernames": desired},
+        event_type="Guest Reconciliation Queued",
+        metadata={
+            "directory_access": access_needed,
+            "guest_policy": policy_needed,
+            "usernames": desired,
+        },
     )
     return job
 
 
-def safe_queue_access_reconciliation(allocation_id):
+def safe_queue_access_reconciliation(allocation_id, *, membership_change=False):
     try:
-        job = create_access_reconciliation_job(allocation_id)
+        job = create_access_reconciliation_job(
+            allocation_id, membership_change=membership_change
+        )
         if job and not job.django_q_task_id:
             dispatch_job(job)
     except Exception:
         logger.exception(
-            "Unable to queue VM directory-access reconciliation for allocation %s",
+            "Unable to queue VM guest reconciliation for allocation %s",
             allocation_id,
         )
+
+
+@transaction.atomic
+def create_guest_patch_job(allocation_id):
+    configuration = get_configuration()
+    if (
+        not configuration.guest_policy_enabled
+        or configuration.guest_patch_mode == configuration.GuestPatchMode.NONE
+    ):
+        return None
+    vm = (
+        VirtualMachine.objects.select_for_update()
+        .select_related("allocation__status")
+        .filter(allocation_id=allocation_id)
+        .first()
+    )
+    if (
+        not vm
+        or vm.allocation.status.name != "Active"
+        or vm.state != VirtualMachine.State.ACTIVE
+    ):
+        return None
+    open_patch_job = vm.provisioning_jobs.filter(
+        action=ProvisioningJob.Action.PATCH,
+        status__in=(ProvisioningJob.Status.QUEUED, ProvisioningJob.Status.RUNNING),
+    ).first()
+    if open_patch_job:
+        return open_patch_job
+    reconciliation_running = vm.provisioning_jobs.filter(
+        action=ProvisioningJob.Action.RECONCILE,
+        status__in=(ProvisioningJob.Status.QUEUED, ProvisioningJob.Status.RUNNING),
+    ).exists()
+    if reconciliation_running:
+        return None
+    job = ProvisioningJob.objects.create(
+        virtual_machine=vm,
+        action=ProvisioningJob.Action.PATCH,
+        metadata={"apply_updates": True, "guest_policy": True},
+    )
+    ProvisioningEvent.objects.create(
+        virtual_machine=vm,
+        job=job,
+        event_type="Guest Patch Queued",
+        metadata={"patch_mode": configuration.guest_patch_mode},
+    )
+    return job
 
 
 @transaction.atomic
@@ -312,7 +385,7 @@ def safe_queue_retirement(allocation_id):
     try:
         require_retirement_review(allocation_id)
         job = create_retirement_job(allocation_id)
-        if job:
+        if job and not job.django_q_task_id:
             dispatch_job(job)
     except Exception:
         logger.exception(

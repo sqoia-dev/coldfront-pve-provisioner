@@ -26,7 +26,9 @@ Django admin:
 - subnet, gateway, DNS, and hostname template;
 - PVE template identity, target nodes, storage, bridge, CPU type, and pool;
 - optional NetBox inventory mirroring, cluster identity, and managed tag;
-- optional guest access reconciliation; and
+- optional guest packages, managed files, systemd units, allocation-membership
+  reconciliation, and patch cadence;
+- optional legacy directory-access reconciliation; and
 - optional guarded retirement, PBS storage, and backup retention.
 
 Credentials and mutation gates stay in protected Django settings. They are not
@@ -44,6 +46,8 @@ The initial public scope is deliberately narrow:
 - Python 3.10 or newer;
 - Django-Q2 through ColdFront;
 - Proxmox VE QEMU virtual machines with cloud-init and a running QEMU Guest Agent;
+- Linux guests with systemd and, when declarative guest policy is enabled, DNF
+  or APT plus the versioned in-guest helper contract;
 - built-in database-backed IPv4 allocation, with an optional NetBox inventory
   mirror; and
 - optional Proxmox Backup Server storage for guarded retirement.
@@ -71,6 +75,15 @@ Retirement validates exact ColdFront and PVE identity plus NetBox identity when
 the optional mirror is enabled, creates and verifies a scoped PBS snapshot,
 records intent before deletion, and keeps the VMID/IP reserved until the backup
 expires and is removed.
+
+Declarative guest policy accepts bounded data, not administrator-provided shell
+commands: validated package names, files beneath approved roots, systemd units,
+and a fixed patch mode. The reference helper independently validates the
+versioned manifest before changing the guest.
+
+The allocation form can generate an Ed25519 key pair in the requester's browser.
+The private key is downloaded locally and is never submitted; only its public
+half follows the existing cloud-init provisioning path.
 
 ## Installation
 
@@ -110,6 +123,11 @@ coldfront configure_pve_provisioner --apply
 coldfront configure_pve_provisioner --check
 ```
 
+If declarative guest policy is enabled, install the reviewed reference helper
+from `examples/coldfront_guest_reconcile.py.example` at the configured path in
+the image or through a protected cloud-init bootstrap. See
+[Guest policy](docs/GUEST-POLICY.md) before enabling it.
+
 See [Deployment](docs/DEPLOYMENT.md) for the full sequence and rollback plan.
 
 ## Protected settings
@@ -145,9 +163,11 @@ Provisioning is idempotent around durable milestones:
 3. refuse PVE collisions or clone the configured template;
 4. configure CPU, memory, cloud-init identity, SSH key, and network;
 5. start the VM and wait for SSH;
-6. optionally wait for the restricted guest-agent policy and reconcile users;
-7. activate optional NetBox records; and
-8. mark the ColdFront VM active.
+6. optionally wait for the guest agent and reconcile declared packages, files,
+   systemd units, and allocation-aware access policy;
+7. optionally run the legacy directory-access helper;
+8. activate optional NetBox records; and
+9. mark the ColdFront VM active.
 
 Transient network, DNS, HTTP 5xx, and directory outages reuse the same identity
 and are retried. Permission errors, collisions, and identity drift fail closed.
@@ -168,6 +188,7 @@ The tests do not contact PVE, NetBox, PBS, DNS, LDAP, or a guest VM.
 - [Configuration reference](docs/CONFIGURATION.md)
 - [Deployment and rollback](docs/DEPLOYMENT.md)
 - [Architecture and lifecycle](docs/ARCHITECTURE.md)
+- [Declarative guest policy and LDAP/SSSD example](docs/GUEST-POLICY.md)
 - [Security checklist](docs/SECURITY-CHECKLIST.md)
 - [Portability and known limits](PORTABILITY.md)
 - [Contributing](CONTRIBUTING.md)

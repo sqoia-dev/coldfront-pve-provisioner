@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Reference in-guest executor for coldfront-pve-guest-policy/v1.
+
+Install this file through a reviewed VM image or cloud-init vendor snippet. Run
+it as root only through a restricted QEMU Guest Agent command allowlist. It
+accepts no shell commands from ColdFront: only package names, managed files,
+systemd units, and a bounded patch mode.
+"""
+
+import argparse
+import base64
+import grp
+import ipaddress
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path, PurePosixPath
+
+SCHEMA = "coldfront-pve-guest-policy/v1"
+PACKAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.:-]{0,127}$")
+UNIT_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}\.(service|socket|timer)$"
+)
+ACCOUNT_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+USERNAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+MODE_PATTERN = re.compile(r"^0[0-7]{3}$")
+ALLOWED_ROOTS = (
+    PurePosixPath("/etc"),
+    PurePosixPath("/opt"),
+    PurePosixPath("/usr/local"),
+)
+DENIED_PATHS = {
+    PurePosixPath("/etc/group"),
+    PurePosixPath("/etc/gshadow"),
+    PurePosixPath("/etc/passwd"),
+    PurePosixPath("/etc/shadow"),
+    PurePosixPath("/etc/sudoers"),
+}
+MAX_INPUT_BYTES = 256 * 1024
+MAX_FILE_BYTES = 64 * 1024
+PRIVATE_MATERIAL_MARKERS = (
+    b"-----BEGIN OPENSSH PRIVATE KEY-----",
+    b"-----BEGIN PRIVATE KEY-----",
+    b"-----BEGIN RSA PRIVATE KEY-----",
+    b"-----BEGIN EC PRIVATE KEY-----",
+)
+
+
+class PolicyError(RuntimeError):
+    pass
+
+
+def run(command, *, timeout=1800):
+    try:
+        return subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        detail = getattr(exc, "stderr", "") or str(exc)
+        raise PolicyError(f"Fixed guest operation failed: {detail[:2000]}") from exc
+
+
+def require_keys(value, expected, label):
+    if not isinstance(value, dict) or set(value) != set(expected):
+        raise PolicyError(f"{label} must contain exactly: {', '.join(expected)}")
+
+
+def validate_path(value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise PolicyError("Managed file path contains an invalid character.")
+    path = PurePosixPath(value)
+    if not path.is_absolute() or ".." in path.parts:
+        raise PolicyError("Managed file path is not a safe absolute path.")
+    if path in DENIED_PATHS or str(path).startswith("/etc/sudoers.d/"):
+        raise PolicyError("Account and privilege files are outside guest policy.")
+    if path in ALLOWED_ROOTS:
+        raise PolicyError("Managed file path must name a file beneath an allowed root.")
+    if not any(path.is_relative_to(root) for root in ALLOWED_ROOTS):
+        raise PolicyError("Managed file is outside /etc, /opt, and /usr/local.")
+    return Path(path)
+
+
+def validate_manifest(manifest):
+    require_keys(
+        manifest,
+        ("allocation", "files", "packages", "schema", "services"),
+        "manifest",
+    )
+    if manifest["schema"] != SCHEMA:
+        raise PolicyError("Unsupported guest policy schema.")
+    require_keys(
+        manifest["allocation"],
+        ("hostname", "id", "ipv4_address", "users", "vmid"),
+        "allocation",
+    )
+    allocation = manifest["allocation"]
+    if (
+        not isinstance(allocation["id"], int)
+        or allocation["id"] < 1
+        or not isinstance(allocation["vmid"], int)
+        or allocation["vmid"] < 1
+        or not isinstance(allocation["hostname"], str)
+        or not 0 < len(allocation["hostname"]) <= 253
+    ):
+        raise PolicyError("Allocation identity is invalid.")
+    try:
+        address = ipaddress.ip_address(allocation["ipv4_address"])
+    except (TypeError, ValueError) as exc:
+        raise PolicyError("Allocation IPv4 address is invalid.") from exc
+    if address.version != 4:
+        raise PolicyError("Allocation address must be IPv4.")
+    if not isinstance(allocation["users"], list) or any(
+        not isinstance(username, str) or not USERNAME_PATTERN.fullmatch(username)
+        for username in allocation["users"]
+    ):
+        raise PolicyError("Allocation user list contains an unsafe username.")
+    require_keys(manifest["packages"], ("manager", "names", "patch_mode"), "packages")
+    require_keys(manifest["services"], ("enable", "units"), "services")
+    packages = manifest["packages"]
+    if packages["manager"] not in {"none", "dnf", "apt"}:
+        raise PolicyError("Unsupported package manager.")
+    if packages["patch_mode"] not in {"none", "security", "all"}:
+        raise PolicyError("Unsupported patch mode.")
+    if packages["manager"] == "apt" and packages["patch_mode"] == "security":
+        raise PolicyError("Security-only patching is not portable through APT.")
+    if packages["manager"] == "none" and (
+        packages["names"] or packages["patch_mode"] != "none"
+    ):
+        raise PolicyError("Package work requires DNF or APT.")
+    if not isinstance(packages["names"], list) or any(
+        not isinstance(name, str) or not PACKAGE_PATTERN.fullmatch(name)
+        for name in packages["names"]
+    ):
+        raise PolicyError("Package list contains an unsafe name.")
+    if len(packages["names"]) != len(set(packages["names"])):
+        raise PolicyError("Package names must be unique.")
+    services = manifest["services"]
+    if not isinstance(services["enable"], bool):
+        raise PolicyError("services.enable must be boolean.")
+    if not isinstance(services["units"], list) or any(
+        not isinstance(unit, str) or not UNIT_PATTERN.fullmatch(unit)
+        for unit in services["units"]
+    ):
+        raise PolicyError("Service list contains an unsafe unit.")
+    if len(services["units"]) != len(set(services["units"])):
+        raise PolicyError("Service units must be unique.")
+    if not isinstance(manifest["files"], list):
+        raise PolicyError("files must be a list.")
+    paths = set()
+    for item in manifest["files"]:
+        require_keys(
+            item,
+            ("content_base64", "group", "mode", "owner", "path"),
+            "managed file",
+        )
+        path = validate_path(item["path"])
+        if path in paths:
+            raise PolicyError("Managed file paths must be unique.")
+        paths.add(path)
+        if (
+            not isinstance(item["owner"], str)
+            or not isinstance(item["group"], str)
+            or not ACCOUNT_PATTERN.fullmatch(item["owner"])
+            or not ACCOUNT_PATTERN.fullmatch(item["group"])
+        ):
+            raise PolicyError("Managed file owner or group is unsafe.")
+        if not isinstance(item["mode"], str) or not MODE_PATTERN.fullmatch(
+            item["mode"]
+        ):
+            raise PolicyError("Managed file mode is not four octal digits.")
+        parsed_mode = int(item["mode"], 8)
+        if parsed_mode & 0o111 or parsed_mode & 0o002:
+            raise PolicyError(
+                "Managed configuration files may not be executable or world-writable."
+            )
+        if not isinstance(item["content_base64"], str):
+            raise PolicyError("Managed file content must be base64 text.")
+        try:
+            content = base64.b64decode(item["content_base64"], validate=True)
+            content.decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise PolicyError(
+                "Managed file content is not valid base64 UTF-8."
+            ) from exc
+        if len(content) > MAX_FILE_BYTES:
+            raise PolicyError("Managed file exceeds 64 KiB.")
+        if any(marker in content for marker in PRIVATE_MATERIAL_MARKERS):
+            raise PolicyError("Private key material is outside guest policy.")
+    return manifest
+
+
+def apply_packages(policy):
+    manager = policy["manager"]
+    names = policy["names"]
+    patch_mode = policy["patch_mode"]
+    changed = False
+    if manager == "dnf":
+        if names:
+            run(["dnf", "-y", "install", "--", *names])
+            changed = True
+        if patch_mode == "security":
+            run(["dnf", "-y", "update", "--security"])
+            changed = True
+        elif patch_mode == "all":
+            run(["dnf", "-y", "update"])
+            changed = True
+    elif manager == "apt":
+        if names or patch_mode == "all":
+            run(["apt-get", "update"])
+        if names:
+            run(["apt-get", "install", "-y", "--no-install-recommends", *names])
+            changed = True
+        if patch_mode == "all":
+            run(["apt-get", "upgrade", "-y"])
+            changed = True
+    return changed
+
+
+def assert_no_symlink(path):
+    current = path
+    while current != Path("/"):
+        if current.is_symlink():
+            raise PolicyError(f"Refusing symlinked managed path component: {current}")
+        current = current.parent
+
+
+def apply_file(item):
+    path = validate_path(item["path"])
+    assert_no_symlink(path)
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    assert_no_symlink(path.parent)
+    content = base64.b64decode(item["content_base64"], validate=True)
+    mode = int(item["mode"], 8)
+    try:
+        uid = pwd.getpwnam(item["owner"]).pw_uid
+        gid = grp.getgrnam(item["group"]).gr_gid
+    except KeyError as exc:
+        raise PolicyError(f"Managed file account is absent: {exc}") from exc
+    if path.exists():
+        stat = path.stat()
+        if (
+            path.read_bytes() == content
+            and stat.st_mode & 0o7777 == mode
+            and stat.st_uid == uid
+            and stat.st_gid == gid
+        ):
+            return False
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.chmod(temporary, mode)
+        os.chown(temporary, uid, gid)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return True
+
+
+def reconcile(manifest):
+    package_changed = apply_packages(manifest["packages"])
+    changed_files = [item["path"] for item in manifest["files"] if apply_file(item)]
+    service_changed = False
+    inputs_changed = package_changed or bool(changed_files)
+    for unit in manifest["services"]["units"]:
+        if manifest["services"]["enable"]:
+            run(["systemctl", "enable", "--now", unit], timeout=300)
+            service_changed = True
+        if inputs_changed:
+            run(["systemctl", "reload-or-restart", unit], timeout=300)
+            service_changed = True
+    return {
+        "changed_files": changed_files,
+        "packages_applied": package_changed,
+        "services_reconciled": service_changed,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--apply-json", action="store_true", required=True)
+    parser.parse_args()
+    if os.geteuid() != 0:
+        raise PolicyError("Guest policy helper must run as root.")
+    raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+    if len(raw) > MAX_INPUT_BYTES:
+        raise PolicyError("Guest policy input exceeds 256 KiB.")
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PolicyError("Guest policy input is not valid UTF-8 JSON.") from exc
+    result = reconcile(validate_manifest(manifest))
+    print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except PolicyError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1) from exc

@@ -41,7 +41,12 @@ def queue_expired_vm_retirement(sender, instance, **kwargs):
 
 def _queue_access_change(instance):
     transaction.on_commit(
-        partial(safe_queue_access_reconciliation, instance.allocation_id), robust=True
+        partial(
+            safe_queue_access_reconciliation,
+            instance.allocation_id,
+            membership_change=True,
+        ),
+        robust=True,
     )
 
 

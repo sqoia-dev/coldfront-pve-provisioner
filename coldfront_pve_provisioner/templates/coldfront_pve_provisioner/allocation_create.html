@@ -1,0 +1,8 @@
+{% extends "allocation/allocation_create.html" %}
+{% load static %}
+
+{% block javascript %}
+{{ block.super }}
+{{ pve_resource_id|json_script:"pve-provisioner-resource-id" }}
+<script src="{% static 'coldfront_pve_provisioner/ssh_key_generator.js' %}" defer></script>
+{% endblock %}

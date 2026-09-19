@@ -37,7 +37,7 @@ The read-only **IP address reservations** admin view shows every current,
 recovery-held, and released reservation. Released historical rows remain visible
 even when a later VM safely reuses the address.
 
-### PVE, optional NetBox, guest access, and retirement
+### PVE, optional NetBox, guest policy, and retirement
 
 The configured PVE template must be an actual QEMU template and its name must
 match `template_name`. Every allowed node must expose the configured bridge with
@@ -48,11 +48,37 @@ creates or reuses one exact cluster type, cluster, and managed tag, then refuses
 any record whose tag or description does not match the ColdFront allocation
 identity. NetBox mirrors the built-in allocation; it does not choose addresses.
 
-Guest access reconciliation is optional. When enabled, the image must contain
-the configured helper and the QEMU Guest Agent must permit `guest-exec` and
-`guest-exec-status`. The plugin sends newline-delimited, validated ColdFront
-usernames to the helper; site-specific LDAP/SSSD policy belongs in the image and
-helper, not this repository.
+Declarative guest policy is optional and disabled by default. Its configuration
+supports:
+
+| Field | Purpose |
+| --- | --- |
+| `guest_policy_enabled` | Apply the declared policy during provisioning and explicit reconciliation. |
+| `guest_policy_helper` | Absolute path to the reviewed helper already installed in the guest image or bootstrap. |
+| `guest_package_manager` | `none`, DNF, or APT. |
+| `guest_packages` | One validated package name per line; paths, options, and commands are rejected. |
+| `guest_service_units` | One `.service`, `.socket`, or `.timer` unit per line. |
+| `guest_enable_services` | Ensure configured units are enabled and started. Changed inputs cause reload-or-restart. |
+| `guest_reconcile_on_membership_change` | Re-render policy after an active allocation user is added, removed, enabled, or disabled. |
+| `guest_patch_mode` | Disabled, DNF security updates, or all updates. APT supports all updates only. |
+| `guest_patch_interval_days` | Queue due patch jobs from the daily scheduler; zero keeps patching manual. |
+
+Add managed files inline on the same configuration page. Destinations must be
+beneath `/etc`, `/opt`, or `/usr/local`; account/privilege files, private keys,
+oversized content, and unsupported template variables are rejected. Available
+variables are `allocation_id`, `vmid`, `hostname`, `ipv4_address`,
+`allocation_users_lines`, `allocation_users_json`, and
+`allocation_users_ldap_filter`.
+
+Managed files contain non-secret policy only. Place LDAP bind credentials,
+private keys, and other secrets in the image or a site-approved secret delivery
+system. Removing or disabling an inline stops management but deliberately does
+not delete the existing guest file.
+
+The earlier directory-access adapter remains available independently for sites
+that already provide its newline-membership helper. New LDAP/SSSD deployments
+can instead render the fail-closed allocation filter through declarative guest
+policy. See [Guest policy](GUEST-POLICY.md).
 
 Guarded retirement is optional. Enabling it requires a PBS-backed PVE storage.
 External deletion still requires `PVE_PROVISIONER_RETIRE=True`.
@@ -81,6 +107,9 @@ Once a flavor is referenced by a VM, its identity and dimensions are immutable.
 | `PVE_PROVISIONER_RETIRE` | for retirement | Independent destructive-work kill switch. |
 
 Restart ColdFront web and Django-Q services after protected setting changes.
+Run `coldfront configure_pve_provisioner --apply` after changing scheduled
+patch settings so the daily queue schedule is created or removed, then run
+`--check`.
 
 ## Configuration changes after use
 
@@ -88,3 +117,9 @@ The model rejects identity-affecting changes after any VM reservation exists.
 This is intentional: existing audit records and external resources must retain
 one meaning. Export the existing state and plan a migration rather than editing
 around the guard.
+
+Guest packages, files, units, helper settings, and patch policy remain editable
+because their purpose is controlled reconciliation of existing VMs. Review and
+canary those changes as infrastructure policy; saving them does not itself call
+PVE, but the next provisioning, membership, manual sync, or scheduled patch job
+can apply them.
