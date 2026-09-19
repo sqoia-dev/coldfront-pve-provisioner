@@ -11,8 +11,14 @@ class NetBoxError(RuntimeError):
 class NetBoxClient:
     def __init__(self):
         self.configuration = get_configuration()
-        self.base_url = settings.PVE_PROVISIONER_NETBOX_API_URL.rstrip("/")
-        token = settings.PVE_PROVISIONER_NETBOX_TOKEN
+        if not self.configuration.netbox_enabled:
+            raise NetBoxError("NetBox inventory mirroring is disabled in Django admin.")
+        self.base_url = getattr(settings, "PVE_PROVISIONER_NETBOX_API_URL", "").rstrip(
+            "/"
+        )
+        if not self.base_url:
+            raise NetBoxError("The NetBox API URL is not configured.")
+        token = getattr(settings, "PVE_PROVISIONER_NETBOX_TOKEN", "")
         if not token:
             raise NetBoxError("The scoped NetBox API token is not configured.")
         self.session = requests.Session()

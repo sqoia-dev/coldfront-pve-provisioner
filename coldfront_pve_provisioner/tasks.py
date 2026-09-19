@@ -25,6 +25,12 @@ from .services import (
 )
 
 
+def _optional_netbox(configuration):
+    if not configuration.netbox_enabled:
+        return None
+    return NetBoxClient()
+
+
 @transaction.atomic
 def _claim_job(job_id):
     job = (
@@ -87,10 +93,18 @@ def run_job(job_id):
         configuration = get_configuration()
         flavor = get_flavor(vm.flavor)
         ssh_public_key = request_ssh_public_key(vm.allocation)
-        netbox = NetBoxClient()
-        netbox_ids = netbox.ensure_reservation(vm, flavor)
-        _record_netbox_identity(vm.pk, netbox_ids)
-        vm.refresh_from_db()
+        netbox = _optional_netbox(configuration)
+        if netbox is not None:
+            netbox_ids = netbox.ensure_reservation(vm, flavor)
+            _record_netbox_identity(vm.pk, netbox_ids)
+            vm.refresh_from_db()
+        else:
+            _record_progress(
+                vm.pk,
+                job.pk,
+                "Internal IP Reservation Confirmed",
+                {"ipv4_address": vm.ipv4_address},
+            )
         pve = ProxmoxClient()
         target_node = pve.ensure_vm(
             vm,
@@ -110,8 +124,9 @@ def run_job(job_id):
                 timeout=600,
             )
             _record_access_sync(vm.pk, job.pk, desired)
-        netbox.activate(vm)
-        _record_progress(vm.pk, job.pk, "NetBox Activated", {})
+        if netbox is not None:
+            netbox.activate(vm)
+            _record_progress(vm.pk, job.pk, "NetBox Activated", {})
     except Exception as exc:
         error = str(exc)[:4000]
         if _schedule_transient_retry(job.pk, error):
@@ -201,10 +216,12 @@ def _run_retirement_job(job, vm):
         return {"status": "blocked", "job_id": str(job.pk)}
     try:
         pve = ProxmoxClient()
+        netbox = _optional_netbox(configuration)
         if vm.pve_deleted_at is None:
-            # Validate both external identities before the first destructive
-            # action, then require a recoverable PBS snapshot.
-            NetBoxClient().validate_exact_managed_records(vm)
+            # Validate every configured external identity before the first
+            # destructive action, then require a recoverable PBS snapshot.
+            if netbox is not None:
+                netbox.validate_exact_managed_records(vm)
             if not vm.retirement_backup_volume:
                 backup = pve.find_exact_retirement_backup(vm)
                 if backup is None:
@@ -257,8 +274,7 @@ def _run_retirement_job(job, vm):
             )
             vm.refresh_from_db()
 
-        netbox = NetBoxClient()
-        if vm.netbox_deleted_at is None:
+        if netbox is not None and vm.netbox_deleted_at is None:
             netbox_intent = vm.events.filter(
                 event_type="NetBox Retirement Intent"
             ).exists()

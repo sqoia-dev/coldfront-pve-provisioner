@@ -7,9 +7,10 @@ PVE_PROVISIONER_TOKEN_ID = "coldfront@pve!worker"
 PVE_PROVISIONER_TOKEN_SECRET = "load-from-secret-storage"
 PVE_PROVISIONER_VERIFY_TLS = "/etc/ssl/certs/site-pve-ca.pem"
 
-PVE_PROVISIONER_NETBOX_API_URL = "https://netbox.example"
-PVE_PROVISIONER_NETBOX_TOKEN = "load-from-secret-storage"
-PVE_PROVISIONER_NETBOX_VERIFY_TLS = True
+# Optional: define only when NetBox inventory mirroring is enabled in admin.
+# PVE_PROVISIONER_NETBOX_API_URL = "https://netbox.example"
+# PVE_PROVISIONER_NETBOX_TOKEN = "load-from-secret-storage"
+# PVE_PROVISIONER_NETBOX_VERIFY_TLS = True
 
 PVE_PROVISIONER_EXECUTE = False
 PVE_PROVISIONER_RETIRE = False

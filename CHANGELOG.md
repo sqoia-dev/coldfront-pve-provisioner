@@ -8,6 +8,10 @@
 - Kept API credentials and mutation gates in protected Django settings.
 - Removed the dependency on a private allocation-interface plugin.
 - Made guest access synchronization and guarded retirement optional.
+- Made NetBox inventory mirroring optional; new configurations use the built-in
+  IPv4 pool and database reservations by default.
+- Added a read-only IP address reservations admin view and human-readable VM,
+  job, and event labels.
 - Added scheduled retirement-backup cleanup.
 - Added packaging metadata, CI, license/notice, deployment, security,
   architecture, configuration, and portability documentation.

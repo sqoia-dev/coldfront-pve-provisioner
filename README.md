@@ -3,10 +3,11 @@
 An administrator-operated ColdFront plugin that turns approved allocations into
 guarded Proxmox VE virtual-machine workflows.
 
-The provisioner reserves VM and network identities in ColdFront, mirrors them in
-NetBox, clones and configures a PVE cloud-init template through a durable Django-Q
-worker, and records an append-only lifecycle trail. Approval queues intent; it
-does not mutate infrastructure inside an HTTP request or signal handler.
+The provisioner reserves VM and network identities in ColdFront's database,
+optionally mirrors them in NetBox, clones and configures a PVE cloud-init
+template through a durable Django-Q worker, and records an append-only lifecycle
+trail. Approval queues intent; it does not mutate infrastructure inside an HTTP
+request or signal handler.
 
 > [!WARNING]
 > This project is alpha software. Its automated tests exercise policy,
@@ -24,7 +25,7 @@ Django admin:
 - VMID and IPv4 pools;
 - subnet, gateway, DNS, and hostname template;
 - PVE template identity, target nodes, storage, bridge, CPU type, and pool;
-- NetBox cluster identity and managed tag;
+- optional NetBox inventory mirroring, cluster identity, and managed tag;
 - optional guest access reconciliation; and
 - optional guarded retirement, PBS storage, and backup retention.
 
@@ -43,11 +44,13 @@ The initial public scope is deliberately narrow:
 - Python 3.10 or newer;
 - Django-Q2 through ColdFront;
 - Proxmox VE QEMU virtual machines with cloud-init and a running QEMU Guest Agent;
-- NetBox as required IPAM/inventory; and
+- built-in database-backed IPv4 allocation, with an optional NetBox inventory
+  mirror; and
 - optional Proxmox Backup Server storage for guarded retirement.
 
-NetBox is currently required. Alternative IPAM backends and multiple independent
-provisioning profiles are not yet implemented.
+The built-in pool is authoritative and is visible through the read-only **IP
+address reservations** admin view. Multiple independent provisioning profiles
+are not yet implemented.
 
 ## Safety model
 
@@ -55,7 +58,8 @@ Three independent controls apply:
 
 1. `ProvisionerConfiguration.enabled` allows this plugin to recognize and queue
    its configured resource.
-2. `PVE_PROVISIONER_EXECUTE=True` permits external PVE and NetBox mutation.
+2. `PVE_PROVISIONER_EXECUTE=True` permits external PVE mutation and, when
+   enabled in admin, NetBox mirroring.
 3. `PVE_PROVISIONER_RETIRE=True`, the admin `retirement_enabled` flag, and a
    configured PBS storage are all required before destructive retirement.
 
@@ -63,9 +67,10 @@ Without the relevant gate, work remains blocked and auditable. Provisioning
 failure retains identity reservations. It never destroys a partially created VM
 or releases an IP automatically.
 
-Retirement validates exact ColdFront, PVE, and NetBox identity before mutation,
-creates and verifies a scoped PBS snapshot, records intent before deletion, and
-keeps the VMID/IP reserved until the backup expires and is removed.
+Retirement validates exact ColdFront and PVE identity plus NetBox identity when
+the optional mirror is enabled, creates and verifies a scoped PBS snapshot,
+records intent before deletion, and keeps the VMID/IP reserved until the backup
+expires and is removed.
 
 ## Installation
 
@@ -118,28 +123,30 @@ PVE_PROVISIONER_TOKEN_ID = "coldfront@pve!provisioner"
 PVE_PROVISIONER_TOKEN_SECRET = "read-from-your-secret-manager"
 PVE_PROVISIONER_VERIFY_TLS = "/etc/pki/ca-trust/source/anchors/pve-ca.pem"
 
-PVE_PROVISIONER_NETBOX_API_URL = "https://netbox.example.org"
-PVE_PROVISIONER_NETBOX_TOKEN = "read-from-your-secret-manager"
-PVE_PROVISIONER_NETBOX_VERIFY_TLS = True
+# Required only when "NetBox inventory mirroring" is enabled in Django admin.
+# PVE_PROVISIONER_NETBOX_API_URL = "https://netbox.example.org"
+# PVE_PROVISIONER_NETBOX_TOKEN = "read-from-your-secret-manager"
+# PVE_PROVISIONER_NETBOX_VERIFY_TLS = True
 
 PVE_PROVISIONER_EXECUTE = False
 PVE_PROVISIONER_RETIRE = False
 ```
 
-Do not commit secrets. Do not set either TLS verification value to `False` in a
-real deployment; use the site CA bundle.
+Do not commit secrets. Do not disable TLS verification for either configured
+service in a real deployment; use the site CA bundle.
 
 ## Worker lifecycle
 
 Provisioning is idempotent around durable milestones:
 
 1. reserve VMID, IPv4 address, hostname, flavor, and template identity;
-2. reserve exact NetBox VM, interface, and IP records;
+2. confirm the built-in IP reservation and, when enabled, reserve exact NetBox
+   VM, interface, and IP records;
 3. refuse PVE collisions or clone the configured template;
 4. configure CPU, memory, cloud-init identity, SSH key, and network;
 5. start the VM and wait for SSH;
 6. optionally wait for the restricted guest-agent policy and reconcile users;
-7. activate the NetBox records; and
+7. activate optional NetBox records; and
 8. mark the ColdFront VM active.
 
 Transient network, DNS, HTTP 5xx, and directory outages reuse the same identity

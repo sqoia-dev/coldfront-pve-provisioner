@@ -25,18 +25,42 @@ class ProvisionerConfiguration(models.Model):
     operating_system = models.CharField(max_length=100, default="Linux cloud image")
     guest_username = models.CharField(max_length=32, default="cloud-user")
 
-    vmid_min = models.PositiveIntegerField(default=1100)
-    vmid_max = models.PositiveIntegerField(default=1199)
+    vmid_min = models.PositiveIntegerField("VMID minimum", default=1100)
+    vmid_max = models.PositiveIntegerField("VMID maximum", default=1199)
     ipv4_pool_start = models.GenericIPAddressField(
-        protocol="IPv4", default="192.0.2.100"
+        "IPv4 pool start",
+        protocol="IPv4",
+        default="192.0.2.100",
+        help_text="First usable IPv4 address in the built-in allocation pool.",
     )
-    ipv4_pool_end = models.GenericIPAddressField(protocol="IPv4", default="192.0.2.199")
-    network_prefix_length = models.PositiveSmallIntegerField(default=24)
-    gateway = models.GenericIPAddressField(protocol="IPv4", default="192.0.2.1")
+    ipv4_pool_end = models.GenericIPAddressField(
+        "IPv4 pool end",
+        protocol="IPv4",
+        default="192.0.2.199",
+        help_text="Last usable IPv4 address in the built-in allocation pool.",
+    )
+    network_prefix_length = models.PositiveSmallIntegerField(
+        "IPv4 prefix length",
+        default=24,
+        help_text="IPv4 CIDR prefix length applied to provisioned VMs.",
+    )
+    gateway = models.GenericIPAddressField(
+        "IPv4 gateway",
+        protocol="IPv4",
+        default="192.0.2.1",
+        help_text="Default IPv4 gateway; it must not be inside the allocation pool.",
+    )
     nameservers = models.TextField(
-        default="1.1.1.1\n1.0.0.1", help_text="One IPv4 address per line."
+        "DNS nameservers",
+        default="1.1.1.1\n1.0.0.1",
+        help_text="One IPv4 address per line.",
     )
-    dns_search_domain = models.CharField(max_length=253, default="example.org")
+    dns_search_domain = models.CharField(
+        "DNS search domain",
+        max_length=253,
+        default="example.org",
+        help_text="DNS search domain and default suffix available to the hostname template.",
+    )
     hostname_template = models.CharField(
         max_length=253,
         default="coldfront-a{allocation_id}-v{vmid}.{domain}",
@@ -58,9 +82,23 @@ class ProvisionerConfiguration(models.Model):
         help_text="Optional PVE storage snippet reference, such as local:snippets/site.yml.",
     )
 
-    netbox_cluster_type = models.CharField(max_length=64, default="Proxmox VE")
-    netbox_cluster_name = models.CharField(max_length=100, default="coldfront-pve")
-    netbox_managed_tag = models.SlugField(max_length=100, default="coldfront-managed")
+    netbox_enabled = models.BooleanField(
+        "NetBox inventory mirroring",
+        default=False,
+        help_text=(
+            "Mirror VM, interface, and IP records to NetBox. The built-in pool remains "
+            "authoritative."
+        ),
+    )
+    netbox_cluster_type = models.CharField(
+        "NetBox cluster type", max_length=64, default="Proxmox VE"
+    )
+    netbox_cluster_name = models.CharField(
+        "NetBox cluster name", max_length=100, default="coldfront-pve"
+    )
+    netbox_managed_tag = models.SlugField(
+        "NetBox managed tag", max_length=100, default="coldfront-managed"
+    )
 
     guest_access_enabled = models.BooleanField(default=False)
     guest_access_group = models.CharField(max_length=64, default="coldfront-vm-access")
@@ -102,6 +140,9 @@ class ProvisionerConfiguration(models.Model):
         try:
             start = ip_address(self.ipv4_pool_start)
             end = ip_address(self.ipv4_pool_end)
+            gateway = ip_address(self.gateway)
+            if not 0 <= self.network_prefix_length <= 32:
+                errors["network_prefix_length"] = "Must be between 0 and 32."
             network = ip_network(f"{start}/{self.network_prefix_length}", strict=False)
             if start > end:
                 errors["ipv4_pool_end"] = "Must not precede the pool start."
@@ -109,19 +150,25 @@ class ProvisionerConfiguration(models.Model):
                 errors["ipv4_pool_end"] = (
                     "The IPv4 pool must contain one address for every VMID."
                 )
-            if (
-                start not in network
-                or end not in network
-                or ip_address(self.gateway) not in network
-            ):
+            if start not in network or end not in network or gateway not in network:
                 errors["ipv4_pool_start"] = (
                     "Pool and gateway must share the configured subnet."
+                )
+            elif start == network.network_address or end == network.broadcast_address:
+                errors["ipv4_pool_start"] = (
+                    "The allocation pool must exclude the subnet network and broadcast addresses."
+                )
+            elif start <= gateway <= end:
+                errors["gateway"] = (
+                    "The gateway must not be inside the allocation pool."
                 )
         except ValueError as exc:
             errors["ipv4_pool_start"] = str(exc)
         for value in self.nameserver_list:
             try:
-                ip_address(value)
+                nameserver = ip_address(value)
+                if nameserver.version != 4:
+                    raise ValueError("IPv6 is not supported by this IPv4 pool.")
             except ValueError:
                 errors["nameservers"] = f"Invalid nameserver address: {value}"
         if not self.allowed_node_list:
@@ -251,6 +298,9 @@ class VMIdentityPool(models.Model):
         if self.singleton != 1:
             raise ValidationError("The VM identity pool must use singleton key 1.")
 
+    def __str__(self):
+        return "PVE VM identity pool"
+
 
 class VMRequest(models.Model):
     """Request material that does not fit ColdFront's 128-byte attributes."""
@@ -262,6 +312,9 @@ class VMRequest(models.Model):
     )
     ssh_public_key = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"VM request for allocation {self.allocation_id}"
 
     def save(self, *args, **kwargs):
         if self.pk:
@@ -343,6 +396,17 @@ class VirtualMachine(models.Model):
             ),
         )
 
+    def __str__(self):
+        return f"{self.hostname} (VMID {self.vmid}, {self.ipv4_address})"
+
+    @property
+    def ip_reservation_status(self):
+        if self.retirement_backup_deleted_at is not None:
+            return "Released"
+        if self.state == self.State.RETIRED:
+            return "Held for recovery"
+        return "Reserved"
+
     def clean(self):
         configuration = get_configuration()
         if not configuration.vmid_min <= self.vmid <= configuration.vmid_max:
@@ -423,6 +487,9 @@ class ProvisioningJob(models.Model):
     class Meta:
         ordering = ("-queued_at",)
 
+    def __str__(self):
+        return f"{self.action} {self.virtual_machine} [{self.status}]"
+
 
 class ProvisioningEvent(models.Model):
     virtual_machine = models.ForeignKey(
@@ -444,6 +511,9 @@ class ProvisioningEvent(models.Model):
     class Meta:
         ordering = ("-occurred_at", "-pk")
 
+    def __str__(self):
+        return f"{self.event_type} — {self.virtual_machine}"
+
     def save(self, *args, **kwargs):
         if self.pk:
             raise ValidationError("Provisioning events are immutable.")
@@ -451,3 +521,12 @@ class ProvisioningEvent(models.Model):
 
     def delete(self, *args, **kwargs):
         raise ValidationError("Provisioning events are retained as audit records.")
+
+
+class IPAddressReservation(VirtualMachine):
+    """Read-only admin projection of built-in IPv4 pool reservations."""
+
+    class Meta:
+        proxy = True
+        verbose_name = "IP address reservation"
+        verbose_name_plural = "IP address reservations"
