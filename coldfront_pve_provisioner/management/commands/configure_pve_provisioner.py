@@ -11,7 +11,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django_q.models import Schedule
 
-from ...constants import RESOURCE_TYPE_NAME, SCHEDULE_NAME
+from ...constants import GUEST_PATCH_SCHEDULE_NAME, RESOURCE_TYPE_NAME, SCHEDULE_NAME
 from ...models import ProvisionerFlavor, VMIdentityPool, get_configuration
 
 ALLOCATION_ATTRIBUTES = {
@@ -142,6 +142,21 @@ class Command(BaseCommand):
                         "repeats": -1,
                     },
                 )
+            if (
+                configuration.guest_policy_enabled
+                and configuration.guest_patch_mode != configuration.GuestPatchMode.NONE
+                and configuration.guest_patch_interval_days
+            ):
+                Schedule.objects.update_or_create(
+                    name=GUEST_PATCH_SCHEDULE_NAME,
+                    defaults={
+                        "func": "coldfront_pve_provisioner.tasks.queue_due_guest_patch_jobs",
+                        "schedule_type": Schedule.DAILY,
+                        "repeats": -1,
+                    },
+                )
+            else:
+                Schedule.objects.filter(name=GUEST_PATCH_SCHEDULE_NAME).delete()
             VMIdentityPool.objects.get_or_create(singleton=1)
 
         errors = []
@@ -175,6 +190,19 @@ class Command(BaseCommand):
             repeats=-1,
         ).exists():
             errors.append("Django-Q dispatcher schedule is absent or incorrect")
+        patch_schedule_expected = (
+            configuration.guest_policy_enabled
+            and configuration.guest_patch_mode != configuration.GuestPatchMode.NONE
+            and bool(configuration.guest_patch_interval_days)
+        )
+        patch_schedule_exists = Schedule.objects.filter(
+            name=GUEST_PATCH_SCHEDULE_NAME,
+            func="coldfront_pve_provisioner.tasks.queue_due_guest_patch_jobs",
+            schedule_type=Schedule.DAILY,
+            repeats=-1,
+        ).exists()
+        if patch_schedule_exists != patch_schedule_expected:
+            errors.append("guest patch schedule is absent, stale, or unexpected")
         if errors:
             raise CommandError("; ".join(errors))
         self.stdout.write(

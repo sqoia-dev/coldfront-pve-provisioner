@@ -5,6 +5,7 @@ from coldfront.core.allocation.models import (
     AllocationPermission,
 )
 from coldfront.core.allocation.views import AllocationCreateView
+from coldfront.core.resource.models import Resource
 from django.contrib.auth.mixins import LoginRequiredMixin, UserPassesTestMixin
 from django.db import transaction
 from django.http import JsonResponse
@@ -40,6 +41,7 @@ PROVISIONING_MILESTONES = {
     "Proxmox VM Running": (65, "VM running"),
     "SSH Ready": (75, "SSH reachable"),
     "Guest Agent Ready": (85, "Guest bootstrap ready"),
+    "Guest Policy Synchronized": (90, "Guest policy applied"),
     "Directory Access Synchronized": (92, "Directory access synchronized"),
     "NetBox Activated": (97, "Network records activated"),
     "Worker Succeeded": (100, "Ready"),
@@ -96,6 +98,16 @@ def set_allocation_attribute(allocation, name, value):
 
 class PVEAllocationRequestView(AllocationCreateView):
     form_class = PVEAllocationRequestForm
+    template_name = "coldfront_pve_provisioner/allocation_create.html"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["pve_resource_id"] = (
+            Resource.objects.filter(name=get_configuration().resource_name)
+            .values_list("pk", flat=True)
+            .first()
+        )
+        return context
 
     @transaction.atomic
     def form_valid(self, form):

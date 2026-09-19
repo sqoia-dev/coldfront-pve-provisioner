@@ -4,6 +4,7 @@ from ipaddress import ip_address
 
 RESOURCE_TYPE_NAME = "Virtual Machine"
 SCHEDULE_NAME = "PVE VM Provisioner queued-job dispatcher"
+GUEST_PATCH_SCHEDULE_NAME = "PVE VM Provisioner guest patch queue"
 
 
 def ipv4_for_vmid(configuration, vmid):

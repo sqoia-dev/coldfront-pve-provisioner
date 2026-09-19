@@ -5,7 +5,10 @@ from ...services import create_access_reconciliation_job, dispatch_job
 
 
 class Command(BaseCommand):
-    help = "Queue exact ColdFront allocation-user access reconciliation for one managed VM."
+    help = (
+        "Queue declarative guest policy and exact allocation-user access "
+        "reconciliation for one managed VM."
+    )
 
     def add_arguments(self, parser):
         parser.add_argument("allocation_id", type=int)
@@ -19,7 +22,8 @@ class Command(BaseCommand):
         if not job:
             self.stdout.write(
                 self.style.SUCCESS(
-                    "VM directory access is already synchronized or provisioning owns it."
+                    "VM guest policy and directory access are already synchronized, "
+                    "disabled, or owned by provisioning."
                 )
             )
             return
@@ -27,6 +31,6 @@ class Command(BaseCommand):
             dispatch_job(job)
         self.stdout.write(
             self.style.SUCCESS(
-                f"Queued directory-access job {job.pk} for VMID {job.virtual_machine.vmid}."
+                f"Queued guest-reconciliation job {job.pk} for VMID {job.virtual_machine.vmid}."
             )
         )

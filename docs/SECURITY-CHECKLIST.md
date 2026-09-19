@@ -11,15 +11,25 @@
 - [ ] The VMID/IP ranges and any configured managed tag cannot collide with another controller.
 - [ ] The cloud image disables password and root SSH login.
 - [ ] Submitted SSH keys are treated as sensitive operational metadata.
+- [ ] Users know the browser-generated private key is unencrypted, downloaded
+      once, and never recoverable from ColdFront.
 - [ ] Django admin is limited to trusted infrastructure operators.
 - [ ] Database and log backups protect allocation identity and audit history.
 - [ ] Worker errors and retries are monitored.
 
-## Guest access
+## Guest policy and access
 
-- [ ] Guest access is disabled unless required.
-- [ ] QGA permits only the minimum commands and the exact helper path.
-- [ ] The helper validates stdin, replaces membership atomically, and fails closed.
+- [ ] Guest policy and legacy guest access are disabled unless required.
+- [ ] The helper is installed as a root-owned reviewed artifact and ordinary
+      guest users cannot replace it.
+- [ ] The helper validates the exact manifest schema, file roots, package names,
+      service units, size limits, and patch modes before mutation.
+- [ ] Admin-managed files contain no passwords, tokens, private keys, or LDAP
+      bind secrets.
+- [ ] Operators account for the generic authority of QGA `guest-exec` when
+      granting and storing PVE credentials.
+- [ ] Package repositories and signing keys are trusted; patch behavior has a
+      maintenance/reboot procedure outside this plugin.
 - [ ] LDAP/SSSD CA validation, authorization, sudo denial, and cache policy are
       reviewed as site configuration.
 

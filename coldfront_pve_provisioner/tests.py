@@ -1,17 +1,46 @@
+import base64
+import json
+import runpy
 from datetime import date
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from coldfront.core.allocation.models import (
+    Allocation,
+    AllocationStatusChoice,
+    AllocationUser,
+    AllocationUserStatusChoice,
+)
+from coldfront.core.field_of_science.models import FieldOfScience
+from coldfront.core.project.models import Project, ProjectStatusChoice
 from coldfront.core.resource.models import Resource
 from django.contrib import admin
+from django.contrib.auth.models import User
+from django.contrib.staticfiles import finders
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
+from django.template.loader import get_template
 from django.test import SimpleTestCase, TestCase, override_settings
 from django_q.models import Schedule
 
-from .constants import hostname_for, ipv4_for_vmid, retirement_backup_notes
+from .constants import (
+    GUEST_PATCH_SCHEDULE_NAME,
+    hostname_for,
+    ipv4_for_vmid,
+    retirement_backup_notes,
+)
+from .forms import PVEAllocationRequestForm
 from .guest_access import normalize_usernames, render_access_reconcile_payload
+from .guest_policy import (
+    ldap_access_filter,
+    normalize_packages,
+    normalize_service_units,
+    render_guest_policy,
+    validate_managed_file_path,
+)
 from .models import (
+    GuestManagedFile,
     IPAddressReservation,
     ProvisionerConfiguration,
     ProvisionerFlavor,
@@ -21,8 +50,17 @@ from .models import (
 )
 from .netbox import NetBoxClient, NetBoxError
 from .proxmox import ProxmoxClient, ProxmoxError
-from .services import validate_initial_service_term
-from .tasks import _is_transient_provisioning_error, _optional_netbox
+from .services import (
+    create_access_reconciliation_job,
+    create_guest_patch_job,
+    validate_initial_service_term,
+)
+from .tasks import (
+    _apply_guest_policy,
+    _is_transient_provisioning_error,
+    _optional_netbox,
+    queue_due_guest_patch_jobs,
+)
 from .validators import validate_ssh_public_key
 from .views import operational_status_payload
 
@@ -103,6 +141,30 @@ class PurePolicyTests(SimpleTestCase):
         with self.assertRaises(ValueError):
             normalize_usernames(["user)(uid=*)"])
 
+    def test_guest_declarations_are_normalized_and_reject_commands(self):
+        self.assertEqual(
+            normalize_packages("sssd\nqemu-guest-agent\nsssd\n"),
+            ("qemu-guest-agent", "sssd"),
+        )
+        self.assertEqual(
+            normalize_service_units("sssd.service\noddjobd.socket\n"),
+            ("oddjobd.socket", "sssd.service"),
+        )
+        with self.assertRaises(ValueError):
+            normalize_packages("/tmp/site-package.rpm")
+        with self.assertRaises(ValueError):
+            normalize_service_units("systemctl restart sssd")
+
+    def test_guest_file_and_ldap_policy_fail_closed(self):
+        self.assertEqual(ldap_access_filter([]), "(uid=__coldfront_no_selected_user__)")
+        self.assertEqual(
+            ldap_access_filter(["bob", "alice"]),
+            "(|(uid=alice)(uid=bob))",
+        )
+        for path in ("/etc", "/etc/passwd", "/etc/sudoers.d/site", "/tmp/site.conf"):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                validate_managed_file_path(path)
+
     def test_retry_policy_is_bounded(self):
         self.assertTrue(
             _is_transient_provisioning_error("Proxmox HTTP 503: unavailable")
@@ -124,6 +186,93 @@ class ConfigurationModelTests(TestCase):
     def test_configuration_accepts_a_complete_generic_site(self):
         configuration = ProvisionerConfiguration(**configuration_values())
         configuration.full_clean()
+
+    def test_declarative_policy_can_use_a_baked_image_without_cloud_init(self):
+        configuration = ProvisionerConfiguration(
+            **configuration_values(
+                cloud_init_vendor_snippet="",
+                guest_access_enabled=False,
+                guest_policy_enabled=True,
+                guest_package_manager="dnf",
+                guest_packages="sssd\noddjob",
+                guest_service_units="sssd.service\noddjobd.service",
+                guest_patch_mode="security",
+                guest_patch_interval_days=7,
+            )
+        )
+        configuration.full_clean()
+
+    def test_declarative_policy_rejects_nonportable_apt_security_mode(self):
+        configuration = ProvisionerConfiguration(
+            **configuration_values(
+                guest_access_enabled=False,
+                guest_policy_enabled=True,
+                guest_package_manager="apt",
+                guest_patch_mode="security",
+            )
+        )
+        with self.assertRaisesMessage(ValidationError, "Security-only patching"):
+            configuration.full_clean()
+
+    def test_managed_file_validates_path_content_and_identity(self):
+        configuration = ProvisionerConfiguration.objects.create(
+            **configuration_values(guest_access_enabled=False)
+        )
+        managed = GuestManagedFile(
+            configuration=configuration,
+            path="/etc/sssd/conf.d/coldfront.conf",
+            content_template="ldap_access_filter = {{ allocation_users_ldap_filter }}\n",
+            mode="0600",
+        )
+        managed.full_clean()
+        for path in ("/etc/shadow", "/var/lib/site.conf"):
+            managed.path = path
+            with self.subTest(path=path), self.assertRaises(ValidationError):
+                managed.full_clean()
+        managed.path = "/etc/site.conf"
+        managed.content_template = "{{ unsupported_value }}"
+        with self.assertRaisesMessage(
+            ValidationError, "Unsupported guest file template"
+        ):
+            managed.full_clean()
+
+    def test_guest_policy_manifest_is_allocation_aware_and_stable(self):
+        configuration = ProvisionerConfiguration.objects.create(
+            **configuration_values(
+                guest_access_enabled=False,
+                guest_policy_enabled=True,
+                guest_package_manager="dnf",
+                guest_packages="sssd\nqemu-guest-agent",
+                guest_service_units="sssd.service",
+                guest_patch_mode="security",
+            )
+        )
+        GuestManagedFile.objects.create(
+            configuration=configuration,
+            path="/etc/sssd/conf.d/coldfront.conf",
+            content_template=(
+                "host = {{ hostname }}\n"
+                "ldap_access_filter = {{ allocation_users_ldap_filter }}\n"
+            ),
+            mode="0600",
+        )
+        vm = SimpleNamespace(
+            allocation_id=51,
+            vmid=2000,
+            hostname="cf-a51-v2000.research.example",
+            ipv4_address="192.0.2.40",
+        )
+        payload, digest = render_guest_policy(
+            configuration, vm, ["bob", "alice"], apply_updates=False
+        )
+        manifest = json.loads(payload)
+        content = base64.b64decode(manifest["files"][0]["content_base64"]).decode()
+        self.assertEqual(manifest["schema"], "coldfront-pve-guest-policy/v1")
+        self.assertEqual(manifest["allocation"]["users"], ["alice", "bob"])
+        self.assertEqual(manifest["packages"]["names"], ["qemu-guest-agent", "sssd"])
+        self.assertEqual(manifest["packages"]["patch_mode"], "none")
+        self.assertIn("ldap_access_filter = (|(uid=alice)(uid=bob))", content)
+        self.assertEqual(len(digest), 64)
 
     def test_configuration_rejects_pool_smaller_than_vmid_range(self):
         configuration = ProvisionerConfiguration(
@@ -185,6 +334,201 @@ class ConfigurationModelTests(TestCase):
                 func="coldfront_pve_provisioner.tasks.cleanup_expired_retirement_backups",
             ).exists()
         )
+
+    def test_catalog_sync_configures_the_optional_patch_queue(self):
+        ProvisionerConfiguration.objects.create(
+            **configuration_values(
+                guest_access_enabled=False,
+                guest_policy_enabled=True,
+                guest_package_manager="dnf",
+                guest_patch_mode="security",
+                guest_patch_interval_days=7,
+            )
+        )
+        ProvisionerFlavor.objects.create(
+            code="small", label="Small", cores=2, memory_mib=4096, disk_gib=40
+        )
+        call_command("configure_pve_provisioner", "--apply", verbosity=0)
+        self.assertTrue(
+            Schedule.objects.filter(
+                name=GUEST_PATCH_SCHEDULE_NAME,
+                func="coldfront_pve_provisioner.tasks.queue_due_guest_patch_jobs",
+                schedule_type=Schedule.DAILY,
+            ).exists()
+        )
+
+
+class GuestPolicyJobTests(TestCase):
+    def setUp(self):
+        self.configuration = ProvisionerConfiguration.objects.create(
+            **configuration_values(
+                guest_access_enabled=False,
+                guest_policy_enabled=True,
+                guest_package_manager="dnf",
+                guest_packages="sssd",
+                guest_service_units="sssd.service",
+                guest_patch_mode="security",
+                guest_patch_interval_days=7,
+            )
+        )
+        GuestManagedFile.objects.create(
+            configuration=self.configuration,
+            path="/etc/sssd/conf.d/coldfront.conf",
+            content_template="ldap_access_filter = {{ allocation_users_ldap_filter }}\n",
+            mode="0600",
+        )
+        user = User.objects.create_user(username="alice")
+        project_status, _ = ProjectStatusChoice.objects.get_or_create(name="Active")
+        field = FieldOfScience.objects.create(description="Guest policy test field")
+        project = Project.objects.create(
+            title="Guest policy test project",
+            pi=user,
+            field_of_science=field,
+            status=project_status,
+        )
+        status = AllocationStatusChoice.objects.filter(name="Active").first()
+        if status is None:
+            status = AllocationStatusChoice.objects.create(name="Active")
+        self.allocation = Allocation.objects.create(
+            project=project,
+            status=status,
+            justification="Test guest policy reconciliation.",
+        )
+        user_status = AllocationUserStatusChoice.objects.filter(name="Active").first()
+        if user_status is None:
+            user_status = AllocationUserStatusChoice.objects.create(name="Active")
+        AllocationUser.objects.create(
+            allocation=self.allocation, user=user, status=user_status
+        )
+        self.vm = VirtualMachine.objects.create(
+            allocation=self.allocation,
+            vmid=2000,
+            ipv4_address="192.0.2.40",
+            hostname=f"cf-a{self.allocation.pk}-v2000.research.example",
+            flavor="small",
+            template_vmid=9000,
+            target_node="pve01",
+            state=VirtualMachine.State.ACTIVE,
+        )
+
+    def test_membership_change_queues_a_policy_reconciliation(self):
+        job = create_access_reconciliation_job(
+            self.allocation.pk, membership_change=True
+        )
+        self.assertEqual(job.action, ProvisioningJob.Action.RECONCILE)
+        self.assertEqual(
+            job.metadata, {"directory_access": False, "guest_policy": True}
+        )
+        self.vm.refresh_from_db()
+        self.assertEqual(self.vm.access_desired_users, ["alice"])
+
+    def test_membership_trigger_can_be_disabled_without_disabling_manual_sync(self):
+        self.configuration.guest_reconcile_on_membership_change = False
+        self.configuration.save()
+        self.assertIsNone(
+            create_access_reconciliation_job(self.allocation.pk, membership_change=True)
+        )
+        self.assertIsNotNone(create_access_reconciliation_job(self.allocation.pk))
+
+    def test_patch_job_is_single_flight(self):
+        job = create_guest_patch_job(self.allocation.pk)
+        self.assertEqual(job.action, ProvisioningJob.Action.PATCH)
+        self.assertEqual(create_guest_patch_job(self.allocation.pk), job)
+
+    @patch("coldfront_pve_provisioner.tasks.dispatch_job")
+    def test_due_patch_queue_dispatches_the_created_job(self, dispatch):
+        result = queue_due_guest_patch_jobs()
+        self.assertEqual(result, {"status": "succeeded", "queued": 1})
+        job = ProvisioningJob.objects.get(action=ProvisioningJob.Action.PATCH)
+        dispatch.assert_called_once_with(job)
+
+    def test_patch_records_the_steady_policy_hash(self):
+        job = ProvisioningJob.objects.create(
+            virtual_machine=self.vm,
+            action=ProvisioningJob.Action.PATCH,
+            status=ProvisioningJob.Status.RUNNING,
+        )
+        pve = Mock()
+        _apply_guest_policy(
+            pve,
+            "pve01",
+            self.vm,
+            job,
+            ["alice"],
+            apply_updates=True,
+        )
+        applied_manifest = json.loads(pve.guest_exec.call_args.kwargs["input_data"])
+        _, baseline_hash = render_guest_policy(
+            self.configuration, self.vm, ["alice"], apply_updates=False
+        )
+        self.vm.refresh_from_db()
+        self.assertEqual(applied_manifest["packages"]["patch_mode"], "security")
+        self.assertEqual(self.vm.guest_policy_hash, baseline_hash)
+        self.assertIsNotNone(self.vm.guest_patched_at)
+
+
+class FrontendKeyGenerationTests(SimpleTestCase):
+    def test_request_template_loads_the_local_key_generator(self):
+        template = get_template("coldfront_pve_provisioner/allocation_create.html")
+        self.assertIn("ssh_key_generator.js", template.template.source)
+        self.assertIn(
+            "Only the public key is submitted",
+            PVEAllocationRequestForm.base_fields["vm_ssh_public_key"].help_text,
+        )
+
+    def test_key_generator_has_no_network_or_private_key_submission_path(self):
+        script_path = finders.find("coldfront_pve_provisioner/ssh_key_generator.js")
+        self.assertIsNotNone(script_path)
+        script = Path(script_path).read_text()
+        self.assertIn('generateKey(\n          { name: "Ed25519" }', script)
+        self.assertIn("BEGIN OPENSSH PRIVATE KEY", script)
+        self.assertNotIn("fetch(", script)
+        self.assertNotIn("XMLHttpRequest", script)
+
+
+class ReferenceGuestHelperTests(SimpleTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        helper_path = (
+            Path(__file__).resolve().parent.parent
+            / "examples"
+            / "coldfront_guest_reconcile.py.example"
+        )
+        cls.helper = runpy.run_path(helper_path)
+
+    def test_reference_helper_rejects_unsafe_package_and_path(self):
+        manifest = {
+            "allocation": {
+                "hostname": "vm.example",
+                "id": 51,
+                "ipv4_address": "192.0.2.40",
+                "users": ["alice"],
+                "vmid": 2000,
+            },
+            "files": [],
+            "packages": {
+                "manager": "dnf",
+                "names": ["/tmp/site.rpm"],
+                "patch_mode": "none",
+            },
+            "schema": "coldfront-pve-guest-policy/v1",
+            "services": {"enable": True, "units": []},
+        }
+        with self.assertRaises(self.helper["PolicyError"]):
+            self.helper["validate_manifest"](manifest)
+        manifest["packages"]["names"] = []
+        manifest["files"] = [
+            {
+                "content_base64": base64.b64encode(b"unsafe").decode(),
+                "group": "root",
+                "mode": "0644",
+                "owner": "root",
+                "path": "/etc/passwd",
+            }
+        ]
+        with self.assertRaises(self.helper["PolicyError"]):
+            self.helper["validate_manifest"](manifest)
 
 
 class AdminPresentationTests(SimpleTestCase):

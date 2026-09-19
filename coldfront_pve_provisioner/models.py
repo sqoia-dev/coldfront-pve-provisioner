@@ -6,11 +6,28 @@ from django.core.exceptions import ValidationError
 from django.db import models
 
 from .constants import hostname_for, ipv4_for_vmid
+from .guest_policy import (
+    normalize_packages,
+    normalize_service_units,
+    validate_file_identity,
+    validate_managed_file_content,
+    validate_managed_file_path,
+)
 from .validators import validate_ssh_public_key
 
 
 class ProvisionerConfiguration(models.Model):
     """Non-secret site policy editable by administrators."""
+
+    class GuestPackageManager(models.TextChoices):
+        NONE = "none", "Do not manage packages"
+        DNF = "dnf", "DNF (RHEL, Rocky, Alma, Fedora)"
+        APT = "apt", "APT (Debian, Ubuntu)"
+
+    class GuestPatchMode(models.TextChoices):
+        NONE = "none", "Do not patch"
+        SECURITY = "security", "Security updates only"
+        ALL = "all", "All available updates"
 
     singleton = models.PositiveSmallIntegerField(
         primary_key=True, default=1, editable=False
@@ -107,6 +124,61 @@ class ProvisionerConfiguration(models.Model):
         max_length=255, default="/usr/local/libexec/coldfront-vm-access-reconcile"
     )
 
+    guest_policy_enabled = models.BooleanField(
+        "Declarative guest policy",
+        default=False,
+        help_text=(
+            "Apply configured packages, files, and services through the versioned "
+            "guest helper contract."
+        ),
+    )
+    guest_policy_helper = models.CharField(
+        "Guest policy helper",
+        max_length=255,
+        default="/usr/local/libexec/coldfront-guest-reconcile",
+        help_text="Absolute path to the reviewed in-guest helper installed by the image or cloud-init.",
+    )
+    guest_package_manager = models.CharField(
+        "Package manager",
+        max_length=8,
+        choices=GuestPackageManager.choices,
+        default=GuestPackageManager.NONE,
+    )
+    guest_packages = models.TextField(
+        "Packages",
+        blank=True,
+        help_text="One package name per line. Shell commands and arguments are not accepted.",
+    )
+    guest_service_units = models.TextField(
+        "Systemd units",
+        blank=True,
+        help_text="One .service, .socket, or .timer unit per line.",
+    )
+    guest_enable_services = models.BooleanField(
+        "Enable configured services",
+        default=True,
+        help_text="Enable and start configured units after package or file reconciliation.",
+    )
+    guest_reconcile_on_membership_change = models.BooleanField(
+        "Reconcile when allocation membership changes",
+        default=True,
+        help_text=(
+            "Queue guest policy after active allocation users are added or removed. "
+            "Existing directory-access reconciliation remains independently configurable."
+        ),
+    )
+    guest_patch_mode = models.CharField(
+        "Patch policy",
+        max_length=8,
+        choices=GuestPatchMode.choices,
+        default=GuestPatchMode.NONE,
+    )
+    guest_patch_interval_days = models.PositiveSmallIntegerField(
+        "Patch interval (days)",
+        default=0,
+        help_text="Zero disables scheduled patch jobs. Manual patch jobs use the same policy.",
+    )
+
     retirement_enabled = models.BooleanField(default=False)
     retirement_backup_storage = models.CharField(max_length=64, blank=True)
     retirement_backup_retention_days = models.PositiveSmallIntegerField(default=30)
@@ -130,6 +202,14 @@ class ProvisionerConfiguration(models.Model):
         return tuple(
             line.strip() for line in self.allowed_nodes.splitlines() if line.strip()
         )
+
+    @property
+    def guest_package_list(self):
+        return normalize_packages(self.guest_packages)
+
+    @property
+    def guest_service_unit_list(self):
+        return normalize_service_units(self.guest_service_units)
 
     def clean(self):
         errors = {}
@@ -185,15 +265,70 @@ class ProvisionerConfiguration(models.Model):
             errors["hostname_template"] = f"Invalid hostname template: {exc}"
         if self.guest_access_enabled and not self.cloud_init_vendor_snippet:
             errors["cloud_init_vendor_snippet"] = (
-                "Required when guest access synchronization is enabled."
+                "Required when the legacy directory-access adapter is enabled."
             )
+        try:
+            packages = self.guest_package_list
+        except ValueError as exc:
+            errors["guest_packages"] = str(exc)
+            packages = ()
+        try:
+            normalize_service_units(self.guest_service_units)
+        except ValueError as exc:
+            errors["guest_service_units"] = str(exc)
+        if packages and self.guest_package_manager == self.GuestPackageManager.NONE:
+            errors["guest_package_manager"] = (
+                "Choose DNF or APT when packages are configured."
+            )
+        if self.guest_patch_mode != self.GuestPatchMode.NONE:
+            if self.guest_package_manager == self.GuestPackageManager.NONE:
+                errors["guest_patch_mode"] = (
+                    "Patching requires a configured package manager."
+                )
+            if (
+                self.guest_package_manager == self.GuestPackageManager.APT
+                and self.guest_patch_mode == self.GuestPatchMode.SECURITY
+            ):
+                errors["guest_patch_mode"] = (
+                    "Security-only patching is not portable through APT; use all updates or disable patching."
+                )
+        if (
+            self.guest_patch_interval_days
+            and self.guest_patch_mode == self.GuestPatchMode.NONE
+        ):
+            errors["guest_patch_interval_days"] = (
+                "Scheduled patching requires a non-disabled patch policy."
+            )
+        for field_name in ("guest_policy_helper", "guest_access_helper"):
+            helper = getattr(self, field_name)
+            if not helper.startswith("/") or any(char.isspace() for char in helper):
+                errors[field_name] = (
+                    "Guest helper paths must be absolute and contain no whitespace."
+                )
         if self.retirement_enabled and not self.retirement_backup_storage:
             errors["retirement_backup_storage"] = (
                 "Required when guarded retirement is enabled."
             )
         original = type(self).objects.filter(pk=self.pk).first() if self.pk else None
         if original is not None and VirtualMachine.objects.exists():
-            mutable_after_use = {"enabled", "resource_description", "allocation_limit"}
+            mutable_after_use = {
+                "allocation_limit",
+                "enabled",
+                "guest_access_enabled",
+                "guest_access_group",
+                "guest_access_helper",
+                "guest_enable_services",
+                "guest_package_manager",
+                "guest_packages",
+                "guest_patch_interval_days",
+                "guest_patch_mode",
+                "guest_policy_enabled",
+                "guest_policy_helper",
+                "guest_reconcile_on_membership_change",
+                "guest_service_units",
+                "guest_user_group",
+                "resource_description",
+            }
             changed = [
                 field.name
                 for field in self._meta.fields
@@ -264,6 +399,65 @@ class ProvisionerFlavor(models.Model):
                 "A flavor referenced by a VM cannot be deleted; disable it instead."
             )
         return super().delete(*args, **kwargs)
+
+
+class GuestManagedFile(models.Model):
+    configuration = models.ForeignKey(
+        ProvisionerConfiguration,
+        on_delete=models.CASCADE,
+        related_name="guest_managed_files",
+    )
+    path = models.CharField(
+        max_length=255,
+        help_text="Absolute destination beneath /etc, /opt, or /usr/local.",
+    )
+    content_template = models.TextField(
+        help_text=(
+            "Non-secret UTF-8 content. Supported variables: allocation_id, vmid, "
+            "hostname, ipv4_address, allocation_users_lines, allocation_users_json, "
+            "and allocation_users_ldap_filter."
+        )
+    )
+    owner = models.CharField(max_length=32, default="root")
+    group = models.CharField(max_length=32, default="root")
+    mode = models.CharField(max_length=4, default="0644")
+    enabled = models.BooleanField(default=True)
+    sort_order = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        ordering = ("sort_order", "path")
+        constraints = (
+            models.UniqueConstraint(
+                fields=("configuration", "path"),
+                name="pve_one_guest_managed_path",
+            ),
+        )
+        verbose_name = "guest managed file"
+        verbose_name_plural = "guest managed files"
+
+    def __str__(self):
+        return self.path
+
+    def clean(self):
+        errors = {}
+        try:
+            self.path = validate_managed_file_path(self.path)
+        except ValueError as exc:
+            errors["path"] = str(exc)
+        try:
+            validate_managed_file_content(self.content_template)
+        except ValueError as exc:
+            errors["content_template"] = str(exc)
+        try:
+            validate_file_identity(self.owner, self.group, self.mode)
+        except ValueError as exc:
+            errors["__all__"] = str(exc)
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
 
 
 def get_configuration(*, require_enabled=True):
@@ -367,6 +561,10 @@ class VirtualMachine(models.Model):
     access_applied_users = models.JSONField(default=list, blank=True)
     access_last_error = models.TextField(blank=True)
     access_synced_at = models.DateTimeField(null=True, blank=True)
+    guest_policy_hash = models.CharField(max_length=64, blank=True)
+    guest_policy_last_error = models.TextField(blank=True)
+    guest_policy_applied_at = models.DateTimeField(null=True, blank=True)
+    guest_patched_at = models.DateTimeField(null=True, blank=True)
     provisioned_at = models.DateTimeField(null=True, blank=True)
     pve_deleted_at = models.DateTimeField(null=True, blank=True)
     netbox_deleted_at = models.DateTimeField(null=True, blank=True)
@@ -453,7 +651,8 @@ class VirtualMachine(models.Model):
 class ProvisioningJob(models.Model):
     class Action(models.TextChoices):
         PROVISION = "Provision", "Provision"
-        RECONCILE = "Reconcile", "Reconcile"
+        RECONCILE = "Reconcile", "Reconcile guest"
+        PATCH = "Patch", "Patch guest"
         RETIRE = "Retire", "Retire"
 
     class Status(models.TextChoices):
@@ -476,6 +675,7 @@ class ProvisioningJob(models.Model):
         max_length=16, choices=Status.choices, default=Status.QUEUED
     )
     attempts = models.PositiveSmallIntegerField(default=0)
+    metadata = models.JSONField(default=dict, blank=True)
     django_q_task_id = models.CharField(max_length=64, blank=True)
     external_upid = models.CharField(max_length=255, blank=True)
     error = models.TextField(blank=True)

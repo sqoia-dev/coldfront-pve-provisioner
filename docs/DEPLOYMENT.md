@@ -24,7 +24,12 @@ cannot call PVE or an enabled NetBox mirror.
 - The VMID range, IPv4 pool, and DNS zone are dedicated or explicitly
   coordinated. If NetBox is enabled, its cluster/tag are also dedicated.
 - The configured cloud-init user and SSH policy exist in the template.
-- If guest access is enabled, its helper and QGA command restriction are tested.
+- If declarative guest policy is enabled, the exact reviewed helper is installed
+  at `guest_policy_helper` in the image or protected bootstrap, owned by root,
+  non-writable by ordinary users, and tested against a sample manifest.
+- If the legacy guest-access adapter is enabled, its separate helper is tested.
+- QGA reports `guest-exec` and `guest-exec-status`; operators understand these
+  are generic execution RPCs and scope the PVE credential accordingly.
 - If retirement is enabled, a disposable VM snapshot/restore exercise proves
   the configured PBS storage works before deletion is authorized.
 
@@ -36,7 +41,14 @@ services, approve one allocation, and observe every durable event.
 
 Verify ColdFront, the IP address reservations admin view, PVE, DNS/network
 reachability, SSH identity, guest-agent readiness (when enabled), optional
-NetBox records, and idempotent re-dispatch. Stop on any mismatch.
+NetBox records, declared packages/files/services, allocation-user removal, and
+idempotent re-dispatch. If patching is enabled, test it separately and confirm
+the guest's reboot requirements. Stop on any mismatch.
+
+Download a browser-generated SSH key during the request canary, verify that only
+its public line appears in the form/database, set local file mode `0600`, and
+prove the private key logs in after provisioning. Also verify the paste-existing
+key path for browsers that do not provide Web Crypto Ed25519.
 
 ## 4. Retirement canary
 

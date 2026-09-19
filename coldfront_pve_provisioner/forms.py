@@ -30,8 +30,9 @@ class PVEAllocationRequestForm(AllocationForm):
             attrs={"rows": 3, "spellcheck": "false", "autocomplete": "off"}
         ),
         help_text=(
-            "Required for a VM request. The key is installed for the configured cloud user; "
-            "password and root SSH login should be disabled in the template."
+            "Required for a VM request. Paste an existing public key or generate one "
+            "in this browser. Only the public key is submitted and installed for the "
+            "configured cloud user."
         ),
     )
 
