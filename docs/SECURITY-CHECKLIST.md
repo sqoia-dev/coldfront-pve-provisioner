@@ -2,13 +2,13 @@
 
 ## Before enabling execution
 
-- [ ] PVE and NetBox use valid TLS with verification enabled.
+- [ ] PVE and any enabled NetBox mirror use valid TLS with verification enabled.
 - [ ] Tokens are stored outside Git and the database.
 - [ ] PVE token permissions are restricted to configured nodes, pool, storage,
       template, VMID range, and required task/guest-agent operations.
-- [ ] NetBox token permissions are restricted to the intended cluster, VM,
+- [ ] When NetBox is enabled, its token permissions are restricted to the intended cluster, VM,
       interface, IP, and tag objects.
-- [ ] The VMID/IP ranges and managed tag cannot collide with another controller.
+- [ ] The VMID/IP ranges and any configured managed tag cannot collide with another controller.
 - [ ] The cloud image disables password and root SSH login.
 - [ ] Submitted SSH keys are treated as sensitive operational metadata.
 - [ ] Django admin is limited to trusted infrastructure operators.

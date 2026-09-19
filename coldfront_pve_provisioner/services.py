@@ -87,13 +87,18 @@ def set_projection(allocation, name, value):
 
 
 def sync_projections(vm):
+    configuration = get_configuration()
     for name, value in (
         ("VM ID", vm.vmid),
         ("VM IPv4 Address", vm.ipv4_address),
         ("VM Hostname", vm.hostname),
         ("VM Proxmox Node", vm.target_node or "Not selected"),
         ("VM Template ID", vm.template_vmid),
-        ("VM NetBox Record ID", vm.netbox_vm_id or "Not created"),
+        (
+            "VM NetBox Record ID",
+            vm.netbox_vm_id
+            or ("Not created" if configuration.netbox_enabled else "Not enabled"),
+        ),
         ("Provisioning State", vm.state),
         ("VM Provisioning Error", vm.last_error),
     ):

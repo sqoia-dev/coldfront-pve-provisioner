@@ -2,9 +2,9 @@
 
 ## Authority split
 
-- **ColdFront**: request, approval, allocation users, reserved identity, durable
-  job state, and audit events.
-- **NetBox**: mirrored VM/interface/IP inventory and lease status.
+- **ColdFront**: request, approval, allocation users, authoritative VM/IP
+  reservation, durable job state, and audit events.
+- **NetBox (optional)**: mirrored VM/interface/IP inventory and lease status.
 - **Proxmox VE**: VM runtime, template, task, and backup state.
 - **Django admin**: non-secret provisioning policy.
 - **Protected settings**: credentials, TLS trust, and mutation kill switches.
@@ -15,10 +15,11 @@ made in the request transaction.
 
 ## Identity invariant
 
-One live or recoverable ColdFront VM owns one VMID, IPv4 address, hostname,
-template identity, and exact NetBox record set. A retired identity remains
-reserved until its recovery backup is deleted. External records must contain the
-managed tag and exact allocation-bound description before mutation proceeds.
+One live or recoverable ColdFront VM owns one VMID, IPv4 address, hostname, and
+template identity. When NetBox mirroring is enabled it also owns one exact
+NetBox record set. A retired identity remains reserved until its recovery backup
+is deleted. Mirrored external records must contain the managed tag and exact
+allocation-bound description before mutation proceeds.
 
 ## Provisioning state machine
 
@@ -33,10 +34,11 @@ errors are not retried as if they were outages.
 
 `Active → Retirement Review → Retiring → Retired`
 
-The worker validates both PVE and NetBox before the first destructive action,
-creates/records/verifies a PBS snapshot, records intent, deletes PVE, then
-deletes NetBox. Each phase is resumable. Cleanup deletes only the exact recorded
-backup after retention and releases identity reuse only after that deletion.
+The worker validates PVE and, when configured, NetBox before the first
+destructive action, creates/records/verifies a PBS snapshot, records intent,
+deletes PVE, then deletes any mirrored NetBox records. Each phase is resumable.
+Cleanup deletes only the exact recorded backup after retention and releases
+identity reuse only after that deletion.
 
 ## Guest access boundary
 

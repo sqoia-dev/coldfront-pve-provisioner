@@ -12,7 +12,7 @@ allocation UI package.
 
 - One configuration profile and one ColdFront VM resource per deployment.
 - Deterministic one-to-one VMID-to-IPv4 mapping.
-- NetBox-backed inventory/IPAM.
+- Built-in deterministic IPv4 allocation with optional NetBox inventory mirroring.
 - QEMU VMs cloned from one cloud-init template.
 - One PVE bridge and storage policy across allowed target nodes.
 - PVE firewall enabled on the inherited primary interface.
@@ -22,7 +22,7 @@ allocation UI package.
 
 ## Not yet portable
 
-Alternative IPAM providers, multiple pools/templates/tenants, LXC, IPv6, DHCP,
+External IPAM authority, multiple pools/templates/tenants, LXC, IPv6, DHCP,
 DNS record mutation, quota/billing, HA placement constraints, online migration,
 and automated restore are outside this release.
 

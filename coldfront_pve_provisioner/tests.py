@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from coldfront.core.resource.models import Resource
+from django.contrib import admin
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.test import SimpleTestCase, TestCase, override_settings
@@ -10,11 +11,18 @@ from django_q.models import Schedule
 
 from .constants import hostname_for, ipv4_for_vmid, retirement_backup_notes
 from .guest_access import normalize_usernames, render_access_reconcile_payload
-from .models import ProvisionerConfiguration, ProvisionerFlavor
+from .models import (
+    IPAddressReservation,
+    ProvisionerConfiguration,
+    ProvisionerFlavor,
+    ProvisioningEvent,
+    ProvisioningJob,
+    VirtualMachine,
+)
 from .netbox import NetBoxClient, NetBoxError
 from .proxmox import ProxmoxClient, ProxmoxError
 from .services import validate_initial_service_term
-from .tasks import _is_transient_provisioning_error
+from .tasks import _is_transient_provisioning_error, _optional_netbox
 from .validators import validate_ssh_public_key
 from .views import operational_status_payload
 
@@ -42,6 +50,7 @@ def configuration_values(**overrides):
         "allowed_nodes": "pve01\npve02",
         "proxmox_pool": "coldfront-managed",
         "cloud_init_vendor_snippet": "shared-vm:snippets/site.yml",
+        "netbox_enabled": True,
         "netbox_cluster_name": "research-pve",
         "netbox_managed_tag": "coldfront-managed",
         "guest_access_enabled": True,
@@ -107,6 +116,11 @@ class PurePolicyTests(SimpleTestCase):
 
 
 class ConfigurationModelTests(TestCase):
+    def test_new_configuration_uses_internal_ipam_by_default(self):
+        configuration = ProvisionerConfiguration(allowed_nodes="pve01")
+        self.assertFalse(configuration.netbox_enabled)
+        configuration.full_clean()
+
     def test_configuration_accepts_a_complete_generic_site(self):
         configuration = ProvisionerConfiguration(**configuration_values())
         configuration.full_clean()
@@ -123,6 +137,15 @@ class ConfigurationModelTests(TestCase):
             **configuration_values(retirement_backup_storage="")
         )
         with self.assertRaises(ValidationError):
+            configuration.full_clean()
+
+    def test_configuration_rejects_gateway_inside_allocation_pool(self):
+        configuration = ProvisionerConfiguration(
+            **configuration_values(gateway="192.0.2.41")
+        )
+        with self.assertRaisesMessage(
+            ValidationError, "gateway must not be inside the allocation pool"
+        ):
             configuration.full_clean()
 
     def test_flavors_are_admin_managed(self):
@@ -162,6 +185,58 @@ class ConfigurationModelTests(TestCase):
                 func="coldfront_pve_provisioner.tasks.cleanup_expired_retirement_backups",
             ).exists()
         )
+
+
+class AdminPresentationTests(SimpleTestCase):
+    def setUp(self):
+        self.vm = VirtualMachine(
+            hostname="cf-a51-v2000.research.example",
+            vmid=2000,
+            ipv4_address="192.0.2.40",
+        )
+
+    def test_operational_models_have_human_readable_labels(self):
+        self.assertEqual(
+            str(self.vm),
+            "cf-a51-v2000.research.example (VMID 2000, 192.0.2.40)",
+        )
+        job = ProvisioningJob(
+            virtual_machine=self.vm,
+            action=ProvisioningJob.Action.PROVISION,
+            status=ProvisioningJob.Status.RUNNING,
+        )
+        self.assertEqual(
+            str(job),
+            "Provision cf-a51-v2000.research.example (VMID 2000, 192.0.2.40) [Running]",
+        )
+        event = ProvisioningEvent(
+            virtual_machine=self.vm, event_type="Internal IP Reservation Confirmed"
+        )
+        self.assertEqual(
+            str(event),
+            "Internal IP Reservation Confirmed — "
+            "cf-a51-v2000.research.example (VMID 2000, 192.0.2.40)",
+        )
+
+    def test_ip_reservations_have_a_dedicated_read_only_admin_view(self):
+        self.assertTrue(IPAddressReservation._meta.proxy)
+        model_admin = admin.site._registry[IPAddressReservation]
+        self.assertFalse(model_admin.has_add_permission(Mock()))
+        self.assertFalse(model_admin.has_change_permission(Mock()))
+        self.assertFalse(model_admin.has_delete_permission(Mock()))
+
+    def test_ip_reservation_status_distinguishes_recovery_and_release(self):
+        self.assertEqual(self.vm.ip_reservation_status, "Reserved")
+        self.vm.state = VirtualMachine.State.RETIRED
+        self.assertEqual(self.vm.ip_reservation_status, "Held for recovery")
+        self.vm.retirement_backup_deleted_at = object()
+        self.assertEqual(self.vm.ip_reservation_status, "Released")
+
+    @patch("coldfront_pve_provisioner.tasks.NetBoxClient")
+    def test_disabled_netbox_does_not_construct_a_client(self, client_class):
+        configuration = SimpleNamespace(netbox_enabled=False)
+        self.assertIsNone(_optional_netbox(configuration))
+        client_class.assert_not_called()
 
 
 @override_settings(
@@ -307,3 +382,12 @@ class NetBoxClientTests(TestCase):
                 "/api/virtualization/virtual-machines/10/",
             ],
         )
+
+
+class DisabledNetBoxClientTests(TestCase):
+    def test_client_refuses_use_when_admin_integration_is_disabled(self):
+        ProvisionerConfiguration.objects.create(
+            **configuration_values(netbox_enabled=False)
+        )
+        with self.assertRaisesMessage(NetBoxError, "disabled in Django admin"):
+            NetBoxClient()

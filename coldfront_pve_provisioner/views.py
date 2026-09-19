@@ -33,6 +33,7 @@ PROVISIONING_MILESTONES = {
     "Identity Reserved": (5, "Identity reserved"),
     "Provisioning Queued": (10, "Queued for provisioning"),
     "Worker Started": (15, "Provisioning worker started"),
+    "Internal IP Reservation Confirmed": (25, "IP address reserved"),
     "NetBox Reservation Confirmed": (25, "Network identity reserved"),
     "Proxmox VM Confirmed": (40, "VM clone confirmed"),
     "Proxmox Configuration Accepted": (55, "VM configuration accepted"),
