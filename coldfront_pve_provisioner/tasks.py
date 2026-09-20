@@ -194,6 +194,7 @@ def _run_access_reconciliation_job(job, vm):
             policy_requested=False,
             access_requested=False,
         )
+        safe_queue_access_reconciliation(vm.allocation_id)
         return {"status": "blocked", "job_id": str(job.pk)}
     if not getattr(settings, "PVE_PROVISIONER_EXECUTE", False):
         error = "External provisioning gate PVE_PROVISIONER_EXECUTE is disabled."
@@ -211,7 +212,19 @@ def _run_access_reconciliation_job(job, vm):
     try:
         pve = ProxmoxClient()
         target = pve.require_exact_vm(vm)
-        if access_requested:
+    except Exception as exc:
+        error = str(exc)[:4000]
+        _finish_guest_job(
+            job.pk,
+            ProvisioningJob.Status.FAILED,
+            error,
+            policy_requested=policy_requested,
+            access_requested=access_requested,
+        )
+        raise
+    component_errors = []
+    if access_requested:
+        try:
             pve.guest_exec(
                 target,
                 vm.vmid,
@@ -221,7 +234,10 @@ def _run_access_reconciliation_job(job, vm):
             )
             _record_access_sync(vm.pk, job.pk, desired)
             access_completed = True
-        if policy_requested:
+        except Exception as exc:  # noqa: BLE001 - record one component, run the other
+            component_errors.append(("Directory access", exc))
+    if policy_requested:
+        try:
             _apply_guest_policy(
                 pve,
                 target,
@@ -231,8 +247,15 @@ def _run_access_reconciliation_job(job, vm):
                 apply_updates=False,
             )
             policy_completed = True
-    except Exception as exc:
-        error = str(exc)[:4000]
+        except Exception as exc:  # noqa: BLE001 - record one component, run the other
+            component_errors.append(("Guest policy", exc))
+    if component_errors:
+        if len(component_errors) == 1:
+            error = str(component_errors[0][1])[:4000]
+        else:
+            error = "; ".join(
+                f"{component}: {failure}" for component, failure in component_errors
+            )[:4000]
         _finish_guest_job(
             job.pk,
             ProvisioningJob.Status.FAILED,
@@ -240,7 +263,9 @@ def _run_access_reconciliation_job(job, vm):
             policy_requested=policy_requested and not policy_completed,
             access_requested=access_requested and not access_completed,
         )
-        raise
+        if len(component_errors) == 1:
+            raise component_errors[0][1]
+        raise RuntimeError(error) from component_errors[0][1]
     _finish_guest_job(
         job.pk,
         ProvisioningJob.Status.SUCCEEDED,
