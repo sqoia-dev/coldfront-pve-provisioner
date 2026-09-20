@@ -262,6 +262,12 @@ def create_access_reconciliation_job(allocation_id, *, membership_change=False):
     ).first()
     if open_job:
         return open_job
+    patch_running = vm.provisioning_jobs.filter(
+        action=ProvisioningJob.Action.PATCH,
+        status__in=(ProvisioningJob.Status.QUEUED, ProvisioningJob.Status.RUNNING),
+    ).exists()
+    if patch_running:
+        return None
     job = ProvisioningJob.objects.create(
         virtual_machine=vm,
         action=ProvisioningJob.Action.RECONCILE,

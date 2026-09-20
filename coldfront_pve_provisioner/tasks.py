@@ -168,11 +168,11 @@ def run_job(job_id):
 
 def _run_access_reconciliation_job(job, vm):
     configuration = get_configuration()
-    policy_requested = bool(
-        job.metadata.get("guest_policy", configuration.guest_policy_enabled)
+    policy_requested = configuration.guest_policy_enabled and bool(
+        job.metadata.get("guest_policy", True)
     )
-    access_requested = bool(
-        job.metadata.get("directory_access", configuration.guest_access_enabled)
+    access_requested = configuration.guest_access_enabled and bool(
+        job.metadata.get("directory_access", True)
     )
     if vm.allocation.status.name != "Active" or vm.state != VirtualMachine.State.ACTIVE:
         error = (
@@ -320,6 +320,7 @@ def _run_guest_patch_job(job, vm):
         policy_requested=True,
         access_requested=False,
     )
+    safe_queue_access_reconciliation(vm.allocation_id)
     return {"status": "succeeded", "job_id": str(job.pk), "vmid": vm.vmid}
 
 

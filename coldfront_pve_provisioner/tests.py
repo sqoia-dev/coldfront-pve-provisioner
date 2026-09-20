@@ -59,6 +59,8 @@ from .tasks import (
     _apply_guest_policy,
     _is_transient_provisioning_error,
     _optional_netbox,
+    _run_access_reconciliation_job,
+    _run_guest_patch_job,
     queue_due_guest_patch_jobs,
 )
 from .validators import validate_ssh_public_key
@@ -435,6 +437,57 @@ class GuestPolicyJobTests(TestCase):
         self.assertEqual(job.action, ProvisioningJob.Action.PATCH)
         self.assertEqual(create_guest_patch_job(self.allocation.pk), job)
 
+    def test_reconciliation_waits_for_an_open_patch_job(self):
+        ProvisioningJob.objects.create(
+            virtual_machine=self.vm,
+            action=ProvisioningJob.Action.PATCH,
+            status=ProvisioningJob.Status.RUNNING,
+        )
+        self.assertIsNone(create_access_reconciliation_job(self.allocation.pk))
+        self.assertFalse(
+            self.vm.provisioning_jobs.filter(
+                action=ProvisioningJob.Action.RECONCILE
+            ).exists()
+        )
+
+    @patch("coldfront_pve_provisioner.tasks.ProxmoxClient")
+    def test_queued_reconciliation_rechecks_the_policy_switch(self, client_class):
+        job = ProvisioningJob.objects.create(
+            virtual_machine=self.vm,
+            action=ProvisioningJob.Action.RECONCILE,
+            status=ProvisioningJob.Status.RUNNING,
+            metadata={"directory_access": False, "guest_policy": True},
+        )
+        self.configuration.guest_policy_enabled = False
+        self.configuration.save(update_fields=["guest_policy_enabled"])
+
+        with patch("coldfront_pve_provisioner.tasks.sync_projections"):
+            result = _run_access_reconciliation_job(job, self.vm)
+
+        self.assertEqual(result, {"status": "blocked", "job_id": str(job.pk)})
+        job.refresh_from_db()
+        self.assertEqual(job.status, ProvisioningJob.Status.BLOCKED)
+        self.assertEqual(job.error, "No guest reconciliation component is enabled.")
+        client_class.assert_not_called()
+
+    @patch("coldfront_pve_provisioner.tasks.ProxmoxClient")
+    def test_queued_reconciliation_rechecks_the_access_switch(self, client_class):
+        job = ProvisioningJob.objects.create(
+            virtual_machine=self.vm,
+            action=ProvisioningJob.Action.RECONCILE,
+            status=ProvisioningJob.Status.RUNNING,
+            metadata={"directory_access": True, "guest_policy": False},
+        )
+
+        with patch("coldfront_pve_provisioner.tasks.sync_projections"):
+            result = _run_access_reconciliation_job(job, self.vm)
+
+        self.assertEqual(result, {"status": "blocked", "job_id": str(job.pk)})
+        job.refresh_from_db()
+        self.assertEqual(job.status, ProvisioningJob.Status.BLOCKED)
+        self.assertEqual(job.error, "No guest reconciliation component is enabled.")
+        client_class.assert_not_called()
+
     @patch("coldfront_pve_provisioner.tasks.dispatch_job")
     def test_due_patch_queue_dispatches_the_created_job(self, dispatch):
         result = queue_due_guest_patch_jobs()
@@ -465,6 +518,27 @@ class GuestPolicyJobTests(TestCase):
         self.assertEqual(applied_manifest["packages"]["patch_mode"], "security")
         self.assertEqual(self.vm.guest_policy_hash, baseline_hash)
         self.assertIsNotNone(self.vm.guest_patched_at)
+
+    @override_settings(PVE_PROVISIONER_EXECUTE=True)
+    @patch("coldfront_pve_provisioner.tasks.safe_queue_access_reconciliation")
+    @patch("coldfront_pve_provisioner.tasks.sync_projections")
+    @patch("coldfront_pve_provisioner.tasks.ProxmoxClient")
+    def test_patch_completion_rechecks_deferred_reconciliation(
+        self, client_class, _sync_projections, queue_reconciliation
+    ):
+        job = ProvisioningJob.objects.create(
+            virtual_machine=self.vm,
+            action=ProvisioningJob.Action.PATCH,
+            status=ProvisioningJob.Status.RUNNING,
+        )
+        client_class.return_value.require_exact_vm.return_value = "pve01"
+
+        result = _run_guest_patch_job(job, self.vm)
+
+        self.assertEqual(
+            result, {"status": "succeeded", "job_id": str(job.pk), "vmid": 2000}
+        )
+        queue_reconciliation.assert_called_once_with(self.allocation.pk)
 
 
 class FrontendKeyGenerationTests(SimpleTestCase):
@@ -529,6 +603,29 @@ class ReferenceGuestHelperTests(SimpleTestCase):
         ]
         with self.assertRaises(self.helper["PolicyError"]):
             self.helper["validate_manifest"](manifest)
+
+    def test_disabled_service_reconciliation_does_not_start_the_unit(self):
+        run = Mock()
+        reconcile = self.helper["reconcile"]
+        with patch.dict(
+            reconcile.__globals__,
+            {
+                "apply_packages": Mock(return_value=True),
+                "run": run,
+            },
+        ):
+            result = reconcile(
+                {
+                    "files": [],
+                    "packages": {},
+                    "services": {"enable": False, "units": ["sssd.service"]},
+                }
+            )
+
+        run.assert_called_once_with(
+            ["systemctl", "try-reload-or-restart", "sssd.service"], timeout=300
+        )
+        self.assertTrue(result["services_reconciled"])
 
 
 class AdminPresentationTests(SimpleTestCase):
