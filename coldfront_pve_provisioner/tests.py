@@ -488,6 +488,40 @@ class GuestPolicyJobTests(TestCase):
         self.assertEqual(job.error, "No guest reconciliation component is enabled.")
         client_class.assert_not_called()
 
+    @override_settings(PVE_PROVISIONER_EXECUTE=True)
+    @patch("coldfront_pve_provisioner.tasks.sync_projections")
+    @patch("coldfront_pve_provisioner.tasks.ProxmoxClient")
+    def test_access_is_applied_before_a_failing_policy(
+        self, client_class, _sync_projections
+    ):
+        self.configuration.guest_access_enabled = True
+        self.configuration.save(update_fields=["guest_access_enabled"])
+        job = ProvisioningJob.objects.create(
+            virtual_machine=self.vm,
+            action=ProvisioningJob.Action.RECONCILE,
+            status=ProvisioningJob.Status.RUNNING,
+            metadata={"directory_access": True, "guest_policy": True},
+        )
+        pve = client_class.return_value
+        pve.require_exact_vm.return_value = "pve01"
+        pve.guest_exec.side_effect = [None, RuntimeError("policy helper failed")]
+
+        with self.assertRaisesMessage(RuntimeError, "policy helper failed"):
+            _run_access_reconciliation_job(job, self.vm)
+
+        self.vm.refresh_from_db()
+        self.assertEqual(self.vm.access_applied_users, ["alice"])
+        self.assertEqual(self.vm.access_last_error, "")
+        self.assertEqual(self.vm.guest_policy_last_error, "policy helper failed")
+        self.assertEqual(
+            pve.guest_exec.call_args_list[0].args[2],
+            [self.configuration.guest_access_helper],
+        )
+        self.assertEqual(
+            pve.guest_exec.call_args_list[1].args[2],
+            [self.configuration.guest_policy_helper, "--apply-json"],
+        )
+
     @patch("coldfront_pve_provisioner.tasks.dispatch_job")
     def test_due_patch_queue_dispatches_the_created_job(self, dispatch):
         result = queue_due_guest_patch_jobs()

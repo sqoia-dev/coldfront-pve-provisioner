@@ -211,16 +211,6 @@ def _run_access_reconciliation_job(job, vm):
     try:
         pve = ProxmoxClient()
         target = pve.require_exact_vm(vm)
-        if policy_requested:
-            _apply_guest_policy(
-                pve,
-                target,
-                vm,
-                job,
-                desired,
-                apply_updates=False,
-            )
-            policy_completed = True
         if access_requested:
             pve.guest_exec(
                 target,
@@ -231,6 +221,16 @@ def _run_access_reconciliation_job(job, vm):
             )
             _record_access_sync(vm.pk, job.pk, desired)
             access_completed = True
+        if policy_requested:
+            _apply_guest_policy(
+                pve,
+                target,
+                vm,
+                job,
+                desired,
+                apply_updates=False,
+            )
+            policy_completed = True
     except Exception as exc:
         error = str(exc)[:4000]
         _finish_guest_job(
