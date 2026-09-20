@@ -540,6 +540,45 @@ class GuestPolicyJobTests(TestCase):
         )
         queue_reconciliation.assert_called_once_with(self.allocation.pk)
 
+    @patch("coldfront_pve_provisioner.tasks.safe_queue_access_reconciliation")
+    @patch("coldfront_pve_provisioner.tasks.sync_projections")
+    def test_blocked_patch_rechecks_deferred_reconciliation(
+        self, _sync_projections, queue_reconciliation
+    ):
+        job = ProvisioningJob.objects.create(
+            virtual_machine=self.vm,
+            action=ProvisioningJob.Action.PATCH,
+            status=ProvisioningJob.Status.RUNNING,
+        )
+        self.configuration.guest_policy_enabled = False
+        self.configuration.save(update_fields=["guest_policy_enabled"])
+
+        result = _run_guest_patch_job(job, self.vm)
+
+        self.assertEqual(result, {"status": "blocked", "job_id": str(job.pk)})
+        queue_reconciliation.assert_called_once_with(self.allocation.pk)
+
+    @override_settings(PVE_PROVISIONER_EXECUTE=True)
+    @patch("coldfront_pve_provisioner.tasks.safe_queue_access_reconciliation")
+    @patch("coldfront_pve_provisioner.tasks.sync_projections")
+    @patch("coldfront_pve_provisioner.tasks.ProxmoxClient")
+    def test_failed_patch_rechecks_deferred_reconciliation(
+        self, client_class, _sync_projections, queue_reconciliation
+    ):
+        job = ProvisioningJob.objects.create(
+            virtual_machine=self.vm,
+            action=ProvisioningJob.Action.PATCH,
+            status=ProvisioningJob.Status.RUNNING,
+        )
+        client_class.return_value.require_exact_vm.side_effect = RuntimeError(
+            "guest helper failed"
+        )
+
+        with self.assertRaisesMessage(RuntimeError, "guest helper failed"):
+            _run_guest_patch_job(job, self.vm)
+
+        queue_reconciliation.assert_called_once_with(self.allocation.pk)
+
 
 class FrontendKeyGenerationTests(SimpleTestCase):
     def test_request_template_loads_the_local_key_generator(self):
