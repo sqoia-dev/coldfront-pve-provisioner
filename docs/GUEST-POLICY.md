@@ -54,8 +54,10 @@ executable or world-writable.
 
 Files are replaced atomically when content, mode, owner, or group differs.
 Configured services are enabled and started; package or file changes also cause
-`systemctl reload-or-restart`. Removing an admin inline does not delete the
-existing guest file. Deliberate deletion remains an operator-owned migration.
+`systemctl reload-or-restart`. When service enablement is disabled, package or
+file changes use `systemctl try-reload-or-restart`, which leaves inactive units
+inactive. Removing an admin inline does not delete the existing guest file.
+Deliberate deletion remains an operator-owned migration.
 
 ## LDAP/SSSD allocation access example
 

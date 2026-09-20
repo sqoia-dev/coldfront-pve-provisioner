@@ -168,11 +168,11 @@ def run_job(job_id):
 
 def _run_access_reconciliation_job(job, vm):
     configuration = get_configuration()
-    policy_requested = bool(
-        job.metadata.get("guest_policy", configuration.guest_policy_enabled)
+    policy_requested = configuration.guest_policy_enabled and bool(
+        job.metadata.get("guest_policy", True)
     )
-    access_requested = bool(
-        job.metadata.get("directory_access", configuration.guest_access_enabled)
+    access_requested = configuration.guest_access_enabled and bool(
+        job.metadata.get("directory_access", True)
     )
     if vm.allocation.status.name != "Active" or vm.state != VirtualMachine.State.ACTIVE:
         error = (
@@ -194,6 +194,7 @@ def _run_access_reconciliation_job(job, vm):
             policy_requested=False,
             access_requested=False,
         )
+        safe_queue_access_reconciliation(vm.allocation_id)
         return {"status": "blocked", "job_id": str(job.pk)}
     if not getattr(settings, "PVE_PROVISIONER_EXECUTE", False):
         error = "External provisioning gate PVE_PROVISIONER_EXECUTE is disabled."
@@ -211,17 +212,19 @@ def _run_access_reconciliation_job(job, vm):
     try:
         pve = ProxmoxClient()
         target = pve.require_exact_vm(vm)
-        if policy_requested:
-            _apply_guest_policy(
-                pve,
-                target,
-                vm,
-                job,
-                desired,
-                apply_updates=False,
-            )
-            policy_completed = True
-        if access_requested:
+    except Exception as exc:
+        error = str(exc)[:4000]
+        _finish_guest_job(
+            job.pk,
+            ProvisioningJob.Status.FAILED,
+            error,
+            policy_requested=policy_requested,
+            access_requested=access_requested,
+        )
+        raise
+    component_errors = []
+    if access_requested:
+        try:
             pve.guest_exec(
                 target,
                 vm.vmid,
@@ -231,8 +234,28 @@ def _run_access_reconciliation_job(job, vm):
             )
             _record_access_sync(vm.pk, job.pk, desired)
             access_completed = True
-    except Exception as exc:
-        error = str(exc)[:4000]
+        except Exception as exc:  # noqa: BLE001 - record one component, run the other
+            component_errors.append(("Directory access", exc))
+    if policy_requested:
+        try:
+            _apply_guest_policy(
+                pve,
+                target,
+                vm,
+                job,
+                desired,
+                apply_updates=False,
+            )
+            policy_completed = True
+        except Exception as exc:  # noqa: BLE001 - record one component, run the other
+            component_errors.append(("Guest policy", exc))
+    if component_errors:
+        if len(component_errors) == 1:
+            error = str(component_errors[0][1])[:4000]
+        else:
+            error = "; ".join(
+                f"{component}: {failure}" for component, failure in component_errors
+            )[:4000]
         _finish_guest_job(
             job.pk,
             ProvisioningJob.Status.FAILED,
@@ -240,7 +263,9 @@ def _run_access_reconciliation_job(job, vm):
             policy_requested=policy_requested and not policy_completed,
             access_requested=access_requested and not access_completed,
         )
-        raise
+        if len(component_errors) == 1:
+            raise component_errors[0][1]
+        raise RuntimeError(error) from component_errors[0][1]
     _finish_guest_job(
         job.pk,
         ProvisioningJob.Status.SUCCEEDED,
@@ -259,37 +284,33 @@ def _run_access_reconciliation_job(job, vm):
 
 def _run_guest_patch_job(job, vm):
     configuration = get_configuration()
-    if vm.allocation.status.name != "Active" or vm.state != VirtualMachine.State.ACTIVE:
-        error = "The allocation or VM is no longer active; refusing guest patching."
+
+    def finish_patch(status, error):
         _finish_guest_job(
             job.pk,
-            ProvisioningJob.Status.BLOCKED,
+            status,
             error,
             policy_requested=True,
             access_requested=False,
         )
+        safe_queue_access_reconciliation(vm.allocation_id)
+
+    if vm.allocation.status.name != "Active" or vm.state != VirtualMachine.State.ACTIVE:
+        error = "The allocation or VM is no longer active; refusing guest patching."
+        finish_patch(ProvisioningJob.Status.BLOCKED, error)
         return {"status": "blocked", "job_id": str(job.pk)}
     if (
         not configuration.guest_policy_enabled
         or configuration.guest_patch_mode == configuration.GuestPatchMode.NONE
     ):
-        _finish_guest_job(
-            job.pk,
+        finish_patch(
             ProvisioningJob.Status.BLOCKED,
             "Guest patching is disabled in Django admin.",
-            policy_requested=True,
-            access_requested=False,
         )
         return {"status": "blocked", "job_id": str(job.pk)}
     if not getattr(settings, "PVE_PROVISIONER_EXECUTE", False):
         error = "External provisioning gate PVE_PROVISIONER_EXECUTE is disabled."
-        _finish_guest_job(
-            job.pk,
-            ProvisioningJob.Status.BLOCKED,
-            error,
-            policy_requested=True,
-            access_requested=False,
-        )
+        finish_patch(ProvisioningJob.Status.BLOCKED, error)
         return {"status": "blocked", "job_id": str(job.pk)}
     desired = desired_access_usernames(vm.allocation)
     try:
@@ -305,21 +326,9 @@ def _run_guest_patch_job(job, vm):
         )
     except Exception as exc:
         error = str(exc)[:4000]
-        _finish_guest_job(
-            job.pk,
-            ProvisioningJob.Status.FAILED,
-            error,
-            policy_requested=True,
-            access_requested=False,
-        )
+        finish_patch(ProvisioningJob.Status.FAILED, error)
         raise
-    _finish_guest_job(
-        job.pk,
-        ProvisioningJob.Status.SUCCEEDED,
-        "",
-        policy_requested=True,
-        access_requested=False,
-    )
+    finish_patch(ProvisioningJob.Status.SUCCEEDED, "")
     return {"status": "succeeded", "job_id": str(job.pk), "vmid": vm.vmid}
 
 

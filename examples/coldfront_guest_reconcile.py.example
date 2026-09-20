@@ -282,7 +282,12 @@ def reconcile(manifest):
             run(["systemctl", "enable", "--now", unit], timeout=300)
             service_changed = True
         if inputs_changed:
-            run(["systemctl", "reload-or-restart", unit], timeout=300)
+            action = (
+                "reload-or-restart"
+                if manifest["services"]["enable"]
+                else "try-reload-or-restart"
+            )
+            run(["systemctl", action, unit], timeout=300)
             service_changed = True
     return {
         "changed_files": changed_files,

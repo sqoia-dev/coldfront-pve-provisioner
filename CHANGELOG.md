@@ -18,5 +18,8 @@
 - Added a read-only IP address reservations admin view and human-readable VM,
   job, and event labels.
 - Added scheduled retirement-backup cleanup.
+- Hardened guest maintenance so disabled policy components cannot execute queued
+  work, patching and reconciliation remain single-flight per VM, and service
+  reconciliation does not start inactive units when service enablement is off.
 - Added packaging metadata, CI, license/notice, deployment, security,
   architecture, configuration, and portability documentation.
